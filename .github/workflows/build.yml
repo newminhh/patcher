@@ -1,0 +1,66 @@
+name: Build & Verify patcher
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-test-patcher:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout newminhh/patcher
+        uses: actions/checkout@v4
+        with:
+          path: patcher
+
+      - name: Pull shared headers from newminhh/common
+        uses: actions/checkout@v4
+        with:
+          repository: newminhh/common
+          path: common
+
+      - name: Set up Python & x86/x32 binutils
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (gcc-multilib, binutils, pyelftools, capstone)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib binutils file
+          python3 -m pip install --upgrade pip pyelftools capstone
+
+      - name: Validate common ABI headers & compile Python modules
+        run: |
+          test -f common/newminhh_abi.h
+          test -f common/newminhh_log.h
+          python3 -m py_compile patcher/re_patcher/*.py
+          bash -n patcher/newminhh-patch
+
+      - name: Smoke-test static i386-to-x32 ELF rewriting
+        run: |
+          mkdir -p /tmp/patcher-smoke
+          cat << 'EOF' > /tmp/patcher-smoke/sample.c
+          #include <stdio.h>
+          int main(void) {
+              puts("PATCHER_SMOKE_OK");
+              return 0;
+          }
+          EOF
+          gcc -m32 -O2 /tmp/patcher-smoke/sample.c -o /tmp/patcher-smoke/sample_i386
+          PYTHONPATH=patcher python3 -m re_patcher.cli /tmp/patcher-smoke/sample_i386 -o /tmp/patcher-smoke/sample_x32
+          file /tmp/patcher-smoke/sample_x32
+          readelf -h /tmp/patcher-smoke/sample_x32 | grep -E "Class:.*ELF32|Machine:.*Advanced Micro Devices X86-64"
+
+      - name: Upload patcher bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: newminhh-patcher
+          path: |
+            patcher/newminhh-patch
+            patcher/re_patcher/
+            common/newminhh_abi.h
+            common/newminhh_log.h
