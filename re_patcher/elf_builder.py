@@ -667,6 +667,10 @@ def build_x32_elf(
             final_phdrs.append(
                 PhdrInfo(PT_DYNAMIC, rw_off, rw_va, rw_va, len(dynamic_bytes), len(dynamic_bytes), PF_R | PF_W, 4)
             )
+        elif p.p_type == 0x6474E551:  # PT_GNU_STACK: always strip PF_X to enforce NX stack
+            final_phdrs.append(
+                PhdrInfo(p.p_type, p.p_offset, p.p_vaddr, p.p_paddr, p.p_filesz, p.p_memsz, p.p_flags & ~PF_X, p.p_align)
+            )
         else:
             final_phdrs.append(p)
 

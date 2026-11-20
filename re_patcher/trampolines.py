@@ -964,5 +964,6 @@ def generate_helper_assembly(
     lines.append("    .byte 0")
     lines.append("__nm_fini_done:")
     lines.append("    .byte 0")
+    lines.append('.section .note.GNU-stack,"",@progbits')
 
     return "\n".join(lines) + "\n"

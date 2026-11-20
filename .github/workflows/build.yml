@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build-and-test-patcher:
     runs-on: ubuntu-latest
@@ -54,6 +57,7 @@ jobs:
           PYTHONPATH=patcher python3 -m re_patcher.cli /tmp/patcher-smoke/sample_i386 -o /tmp/patcher-smoke/sample_x32
           file /tmp/patcher-smoke/sample_x32
           readelf -h /tmp/patcher-smoke/sample_x32 | grep -E "Class:.*ELF32|Machine:.*Advanced Micro Devices X86-64"
+          ! readelf -W -l /tmp/patcher-smoke/sample_x32 | grep "GNU_STACK" | grep -q "RWE"
 
       - name: Upload patcher bundle artifact
         uses: actions/upload-artifact@v4
