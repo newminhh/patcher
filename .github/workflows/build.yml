@@ -38,6 +38,7 @@ jobs:
 
       - name: Validate common ABI headers & compile Python modules
         run: |
+          test -f common/newminhh_cstd.h
           test -f common/newminhh_abi.h
           test -f common/newminhh_log.h
           python3 -m py_compile patcher/re_patcher/*.py
@@ -66,5 +67,6 @@ jobs:
           path: |
             patcher/newminhh-patch
             patcher/re_patcher/
+            common/newminhh_cstd.h
             common/newminhh_abi.h
             common/newminhh_log.h
