@@ -17,13 +17,19 @@ jobs:
       - name: Checkout newminhh/patcher
         uses: actions/checkout@v4
         with:
-          path: patcher
+          path: src/patcher
 
       - name: Pull shared headers from newminhh/common
         uses: actions/checkout@v4
         with:
           repository: newminhh/common
-          path: common
+          path: src/common
+
+      - name: Pull lookup dependency from newminhh/lookup
+        uses: actions/checkout@v4
+        with:
+          repository: newminhh/lookup
+          path: src/lookup
 
       - name: Set up Python & x86/x32 binutils
         uses: actions/setup-python@v5
@@ -33,16 +39,34 @@ jobs:
       - name: Install dependencies (gcc-multilib, binutils, pyelftools, capstone)
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-multilib binutils file
+          sudo apt-get install -y gcc-multilib binutils file make
           python3 -m pip install --upgrade pip pyelftools capstone
+
+      - name: Build lookup generator for registry checks
+        run: |
+          make -C src/lookup CC="gcc" all
+
+      - name: Registry Drift Check (Python registry)
+        run: |
+          set -euxo pipefail
+          src/lookup/newminhh-lookup-gen --emit-py-registry src/lookup/rules.d -o /tmp/_lookup_registry_gen.py
+          diff -u src/patcher/re_patcher/_lookup_registry_gen.py /tmp/_lookup_registry_gen.py
 
       - name: Validate common ABI headers & compile Python modules
         run: |
-          test -f common/newminhh_cstd.h
-          test -f common/newminhh_abi.h
-          test -f common/newminhh_log.h
-          python3 -m py_compile patcher/re_patcher/*.py
-          bash -n patcher/newminhh-patch
+          test -f src/common/newminhh_cstd.h
+          test -f src/common/newminhh_abi.h
+          test -f src/common/newminhh_log.h
+          python3 -m py_compile $(find src/patcher/re_patcher -name '*.py' -print)
+          bash -n src/patcher/newminhh-patch
+
+      - name: Verify lookup.py, level3/sanitize.py, stubgen.py, and asm_emitter.py
+        run: |
+          set -euxo pipefail
+          PYTHONPATH=src/patcher python3 src/patcher/re_patcher/lookup.py
+          PYTHONPATH=src/patcher python3 src/patcher/re_patcher/level3/sanitize.py
+          PYTHONPATH=src/patcher python3 -c "import re_patcher.stubgen, re_patcher.asm_emitter; print('imports-ok')"
+          python3 -m py_compile src/patcher/re_patcher/lookup.py src/patcher/re_patcher/level3/sanitize.py src/patcher/re_patcher/stubgen.py src/patcher/re_patcher/asm_emitter.py
 
       - name: Smoke-test static i386-to-x32 ELF rewriting
         run: |
@@ -55,7 +79,7 @@ jobs:
           }
           EOF
           gcc -m32 -O2 /tmp/patcher-smoke/sample.c -o /tmp/patcher-smoke/sample_i386
-          PYTHONPATH=patcher python3 -m re_patcher.cli /tmp/patcher-smoke/sample_i386 -o /tmp/patcher-smoke/sample_x32
+          PYTHONPATH=src/patcher python3 -m re_patcher.cli /tmp/patcher-smoke/sample_i386 -o /tmp/patcher-smoke/sample_x32
           file /tmp/patcher-smoke/sample_x32
           readelf -h /tmp/patcher-smoke/sample_x32 | grep -E "Class:.*ELF32|Machine:.*Advanced Micro Devices X86-64"
           ! readelf -W -l /tmp/patcher-smoke/sample_x32 | grep "GNU_STACK" | grep -q "RWE"
@@ -65,8 +89,8 @@ jobs:
         with:
           name: newminhh-patcher
           path: |
-            patcher/newminhh-patch
-            patcher/re_patcher/
-            common/newminhh_cstd.h
-            common/newminhh_abi.h
-            common/newminhh_log.h
+            src/patcher/newminhh-patch
+            src/patcher/re_patcher/
+            src/common/newminhh_cstd.h
+            src/common/newminhh_abi.h
+            src/common/newminhh_log.h

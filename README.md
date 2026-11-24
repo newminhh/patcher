@@ -4,6 +4,8 @@ Containerized (`re-env:latest`) hybrid static binary patcher (`newminhh-patch` /
 
 Transforms i386 `ELF32` (`EM_386`) executables and shared libraries into native x32 `ELF32` (`EM_X86_64`) binaries using `/libx32/ld-linux-x32.so.2` and `libnewminhh_compat.so` ([`newminhh/compat`](https://github.com/newminhh/compat)), with automatic or explicit per-function hybrid DBT fallback ([`newminhh/dbt`](https://github.com/newminhh/dbt)).
 
+The patcher implements a Multi-Level Patcher pipeline: **Level 1** (lookup-driven static byte rewriting), **Level 2A** (CFG-driven anchor-preserving symbolic rewrite, default after verification), gated **Level 2B** (full relocatable PIE rebuild), and gated **Level 3A** (selective freestanding recompile boost) + **3C `--decompile-assist`** with `rz-ghidra`, Ghidra, IDA Pro, and Universal IDA Free backends. It consumes layered [`newminhh/lookup`](../lookup/README.md) ABI classification/registry data and follows multi-distro glibc+musl x32 trigger/cache precedence where lookup resolution applies.
+
 ---
 
 ## Files
@@ -44,7 +46,16 @@ Transforms i386 `ELF32` (`EM_386`) executables and shared libraries into native 
 
 ---
 
+## Lookup & Multi-Level Patcher
+
+- **Lookup integration**: Uses [`src/lookup`](../lookup/README.md) layered `lookup_table.txt` precedence and generated Python registry (`re_patcher/_lookup_registry_gen.py`) for ABI classification.
+- **Levels**: Level 1 / Level 2A / gated Level 2B / gated Level 3A + 3C `--decompile-assist`.
+- **Decompile-assist backends**: `rz-ghidra`, Ghidra, IDA Pro, and Universal IDA Free (via export/import workflow).
+
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](https://github.com/newminhh/docs/blob/main/ARCHITECTURE.md) — Detailed walkthrough of the 3-stage patching pipeline, 4-byte stack-stride encoding rules, dual-ABI dispatch, and ELF segment layout
+- [`docs/patcher_levels.md`](https://github.com/newminhh/docs/blob/main/patcher_levels.md) — Multi-Level Patcher levels, gates, decompiler backends, and CLI flags
+- [`docs/lookup_table.md`](https://github.com/newminhh/docs/blob/main/lookup_table.md) — Lookup schema, merge precedence, and ABI classification contracts
+- [`docs/distro_triggers.md`](https://github.com/newminhh/docs/blob/main/distro_triggers.md) — Multi-distro glibc+musl x32 trigger and lookup regeneration policy
 - [`docs/TESTING_AND_VM.md`](https://github.com/newminhh/docs/blob/main/TESTING_AND_VM.md) — Part 3 static/hybrid patcher test suite and N01–N09 negative fixture checks

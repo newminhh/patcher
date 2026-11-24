@@ -1,26 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# newminhh-patch — Hybrid Static Binary Patcher CLI (backed by Docker re-env:latest)
-# Usage: newminhh-patch [--hybrid-fallback] [--no-hybrid-fallback] [--use-ghidra] [--use-r2] <input-i386-elf> -o <output-x32-elf>
+# newminhh-patch — Hybrid Static Binary Patcher CLI (native-first with Docker fallback)
+# Usage: newminhh-patch [options] <input-i386-elf> [-o <output-x32-elf>]
 
 PATCHER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RE_IMAGE="${NEWMINHH_RE_IMAGE:-re-env:latest}"
 
 usage() {
     cat >&2 <<'EOF'
-Usage: newminhh-patch [--hybrid-fallback] [--no-hybrid-fallback] [--use-ghidra] [--use-r2] <input-i386-elf> -o <output-x32-elf>
+Usage: newminhh-patch [options] <input-i386-elf> [-o <output-x32-elf>]
+
+Options:
+  --docker                  Run inside Docker ($NEWMINHH_RE_IMAGE, default: re-env:latest)
+  --level <N>               Translation level (1, 2, 3)
+  --lookup-table <path>     Path to indirect branch lookup table
+  --sysroot <path>          Path to target sysroot
+  --target-interp <path>    Explicit ELF interpreter path
+  --allow-untyped-unsafe    Allow untyped unsafe translations
+  --emit-asm <dir>          Emit generated assembly bundle
+  --from-asm <dir>          Build ELF from previously emitted assembly bundle
+  --relocatable             Generate position-independent / relocatable output
+  --decompile-assist <dir>  Decompilation assistance mode (IDA Free export dir)
+  --import-decompiled <dir> Import decompiled C sources directory
+  --decompiler <name>       Decompiler backend to use (auto, ghidra, ida, rz-ghidra)
+  --l3-trials <N>           Number of Level 3 translation trials
+  --hybrid-fallback         Force hybrid fallback mode (embed .newminhh.orig + link libnewminhh_dbt.so)
+  --no-hybrid-fallback      Force pure static mode (fail if any function requires DBT)
+  --use-ghidra              Invoke Ghidra headless analyzer
+  --use-r2                  Invoke radare2 / rizin analyzer
+  -v, --verbose             Verbose diagnostics
+  -o, --output <file>       Output x32 EM_X86_64 ELF32 path (optional with --decompile-assist or --emit-asm)
+  -h, --help                Show this help message
 EOF
 }
 
 INPUT_PATH=""
 OUTPUT_PATH=""
+LOOKUP_TABLE_PATH=""
+EMIT_ASM_PATH=""
+FROM_ASM_PATH=""
+DECOMPILE_ASSIST_PATH=""
+IMPORT_DECOMPILED_PATH=""
+USE_DOCKER=0
 EXTRA_FLAGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --hybrid-fallback|--no-hybrid-fallback|--use-ghidra|--use-r2|-v|--verbose)
-            EXTRA_FLAGS+=("$1")
+        --docker)
+            USE_DOCKER=1
             shift
             ;;
         -o|--output)
@@ -31,6 +59,102 @@ while [[ $# -gt 0 ]]; do
             fi
             OUTPUT_PATH="$2"
             shift 2
+            ;;
+        --output=*)
+            OUTPUT_PATH="${1#*=}"
+            shift
+            ;;
+        --level|--sysroot|--target-interp|--decompiler|--l3-trials)
+            if [[ $# -lt 2 ]]; then
+                echo "[newminhh:patcher] ERROR: missing argument after $1" >&2
+                usage
+                exit 2
+            fi
+            EXTRA_FLAGS+=("$1" "$2")
+            shift 2
+            ;;
+        --level=*|--sysroot=*|--target-interp=*|--decompiler=*|--l3-trials=*)
+            EXTRA_FLAGS+=("$1")
+            shift
+            ;;
+        --lookup-table)
+            if [[ $# -lt 2 ]]; then
+                echo "[newminhh:patcher] ERROR: missing argument after $1" >&2
+                usage
+                exit 2
+            fi
+            LOOKUP_TABLE_PATH="$2"
+            EXTRA_FLAGS+=("$1" "$2")
+            shift 2
+            ;;
+        --lookup-table=*)
+            LOOKUP_TABLE_PATH="${1#*=}"
+            EXTRA_FLAGS+=("$1")
+            shift
+            ;;
+        --emit-asm)
+            if [[ $# -lt 2 ]]; then
+                echo "[newminhh:patcher] ERROR: missing argument after $1" >&2
+                usage
+                exit 2
+            fi
+            EMIT_ASM_PATH="$2"
+            EXTRA_FLAGS+=("$1" "$2")
+            shift 2
+            ;;
+        --emit-asm=*)
+            EMIT_ASM_PATH="${1#*=}"
+            EXTRA_FLAGS+=("$1")
+            shift
+            ;;
+        --from-asm)
+            if [[ $# -lt 2 ]]; then
+                echo "[newminhh:patcher] ERROR: missing argument after $1" >&2
+                usage
+                exit 2
+            fi
+            FROM_ASM_PATH="$2"
+            EXTRA_FLAGS+=("$1" "$2")
+            shift 2
+            ;;
+        --from-asm=*)
+            FROM_ASM_PATH="${1#*=}"
+            EXTRA_FLAGS+=("$1")
+            shift
+            ;;
+        --decompile-assist)
+            if [[ $# -lt 2 ]]; then
+                echo "[newminhh:patcher] ERROR: missing argument after $1" >&2
+                usage
+                exit 2
+            fi
+            DECOMPILE_ASSIST_PATH="$2"
+            EXTRA_FLAGS+=("$1" "$2")
+            shift 2
+            ;;
+        --decompile-assist=*)
+            DECOMPILE_ASSIST_PATH="${1#*=}"
+            EXTRA_FLAGS+=("$1")
+            shift
+            ;;
+        --import-decompiled)
+            if [[ $# -lt 2 ]]; then
+                echo "[newminhh:patcher] ERROR: missing argument after $1" >&2
+                usage
+                exit 2
+            fi
+            IMPORT_DECOMPILED_PATH="$2"
+            EXTRA_FLAGS+=("$1" "$2")
+            shift 2
+            ;;
+        --import-decompiled=*)
+            IMPORT_DECOMPILED_PATH="${1#*=}"
+            EXTRA_FLAGS+=("$1")
+            shift
+            ;;
+        --hybrid-fallback|--no-hybrid-fallback|--allow-untyped-unsafe|--relocatable|--use-ghidra|--use-r2|-v|--verbose)
+            EXTRA_FLAGS+=("$1")
+            shift
             ;;
         -h|--help)
             usage
@@ -53,8 +177,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "${INPUT_PATH}" || -z "${OUTPUT_PATH}" ]]; then
-    echo "[newminhh:patcher] ERROR: both <input-i386-elf> and -o <output-x32-elf> are required" >&2
+if [[ -z "${INPUT_PATH}" ]]; then
+    echo "[newminhh:patcher] ERROR: <input-i386-elf> is required" >&2
+    usage
+    exit 2
+fi
+
+if [[ -z "${OUTPUT_PATH}" && -z "${DECOMPILE_ASSIST_PATH}" && -z "${EMIT_ASM_PATH}" ]]; then
+    echo "[newminhh:patcher] ERROR: -o <output-x32-elf> is required unless --decompile-assist or --emit-asm is specified" >&2
     usage
     exit 2
 fi
@@ -64,66 +194,122 @@ if [[ ! -e "${INPUT_PATH}" ]]; then
     exit 1
 fi
 
+ABS_IN="$(readlink -f -- "${INPUT_PATH}")"
+IN_DIR="$(dirname -- "${ABS_IN}")"
+IN_BASE="$(basename -- "${ABS_IN}")"
+
+ABS_OUT=""
+ABS_OUT_DIR=""
+OUT_BASE=""
+if [[ -n "${OUTPUT_PATH}" ]]; then
+    OUT_PARENT="$(dirname -- "${OUTPUT_PATH}")"
+    mkdir -p -- "${OUT_PARENT}"
+    ABS_OUT_DIR="$(cd -- "${OUT_PARENT}" && pwd)"
+    OUT_BASE="$(basename -- "${OUTPUT_PATH}")"
+    ABS_OUT="${ABS_OUT_DIR}/${OUT_BASE}"
+
+    if [[ "${ABS_IN}" == "${ABS_OUT}" ]]; then
+        echo "[newminhh:patcher] ERROR: input and output paths must be distinct" >&2
+        exit 2
+    fi
+
+    # Remove any stale output before patching so failed runs never leave stale artifacts
+    rm -f -- "${ABS_OUT}"
+fi
+
+if [[ "${USE_DOCKER}" -eq 0 ]]; then
+    # Native-first execution mode
+    CLI_CMD=(python3 -m re_patcher.cli "${EXTRA_FLAGS[@]}" "${INPUT_PATH}")
+    if [[ -n "${OUTPUT_PATH}" ]]; then
+        CLI_CMD+=(-o "${OUTPUT_PATH}")
+    fi
+    PYTHONPATH="${PATCHER_DIR}:${PYTHONPATH:-}" exec "${CLI_CMD[@]}"
+fi
+
+# Docker execution mode (--docker)
 if ! command -v docker >/dev/null 2>&1; then
     echo "[newminhh:patcher] ERROR: docker not found in PATH" >&2
     exit 1
 fi
 
-ABS_IN="$(readlink -f -- "${INPUT_PATH}")"
-IN_DIR="$(dirname -- "${ABS_IN}")"
-IN_BASE="$(basename -- "${ABS_IN}")"
-
-OUT_PARENT="$(dirname -- "${OUTPUT_PATH}")"
-mkdir -p -- "${OUT_PARENT}"
-ABS_OUT_DIR="$(cd -- "${OUT_PARENT}" && pwd)"
-OUT_BASE="$(basename -- "${OUTPUT_PATH}")"
-ABS_OUT="${ABS_OUT_DIR}/${OUT_BASE}"
-
-if [[ "${ABS_IN}" == "${ABS_OUT}" ]]; then
-    echo "[newminhh:patcher] ERROR: input and output paths must be distinct" >&2
-    exit 2
-fi
-
-# Remove any stale output before patching so failed runs never leave stale artifacts
-rm -f -- "${ABS_OUT}"
-
 DOCKER_MOUNTS=(
     -v "${PATCHER_DIR}:/opt/newminhh_patcher:ro"
-    -v "${ABS_OUT_DIR}:/work_out:rw"
 )
 
-if [[ "${IN_DIR}" == "${ABS_OUT_DIR}" ]]; then
-    CONTAINER_IN="/work_out/${IN_BASE}"
+if [[ -n "${OUTPUT_PATH}" ]]; then
+    DOCKER_MOUNTS+=(-v "${ABS_OUT_DIR}:/work_out:rw")
+    if [[ "${IN_DIR}" == "${ABS_OUT_DIR}" ]]; then
+        CONTAINER_IN="/work_out/${IN_BASE}"
+    else
+        DOCKER_MOUNTS+=(-v "${IN_DIR}:/work_in:ro")
+        CONTAINER_IN="/work_in/${IN_BASE}"
+    fi
+    CONTAINER_OUT="/work_out/${OUT_BASE}"
 else
     DOCKER_MOUNTS+=(-v "${IN_DIR}:/work_in:ro")
     CONTAINER_IN="/work_in/${IN_BASE}"
+    CONTAINER_OUT=""
 fi
-CONTAINER_OUT="/work_out/${OUT_BASE}"
+
+# Bind-mount helper paths if provided
+if [[ -n "${LOOKUP_TABLE_PATH}" && -e "${LOOKUP_TABLE_PATH}" ]]; then
+    ABS_LT="$(readlink -f -- "${LOOKUP_TABLE_PATH}")"
+    DOCKER_MOUNTS+=(-v "${ABS_LT}:${ABS_LT}:ro")
+fi
+if [[ -n "${EMIT_ASM_PATH}" ]]; then
+    mkdir -p -- "${EMIT_ASM_PATH}"
+    ABS_EA="$(readlink -f -- "${EMIT_ASM_PATH}")"
+    DOCKER_MOUNTS+=(-v "${ABS_EA}:${ABS_EA}:rw")
+fi
+if [[ -n "${FROM_ASM_PATH}" && -e "${FROM_ASM_PATH}" ]]; then
+    ABS_FA="$(readlink -f -- "${FROM_ASM_PATH}")"
+    DOCKER_MOUNTS+=(-v "${ABS_FA}:${ABS_FA}:ro")
+fi
+if [[ -n "${DECOMPILE_ASSIST_PATH}" ]]; then
+    mkdir -p -- "${DECOMPILE_ASSIST_PATH}"
+    ABS_DA="$(readlink -f -- "${DECOMPILE_ASSIST_PATH}")"
+    DOCKER_MOUNTS+=(-v "${ABS_DA}:${ABS_DA}:rw")
+fi
+if [[ -n "${IMPORT_DECOMPILED_PATH}" && -e "${IMPORT_DECOMPILED_PATH}" ]]; then
+    ABS_ID="$(readlink -f -- "${IMPORT_DECOMPILED_PATH}")"
+    DOCKER_MOUNTS+=(-v "${ABS_ID}:${ABS_ID}:ro")
+fi
+
+DOCKER_CMD=(
+    docker run --rm
+    --user "$(id -u):$(id -g)"
+    -e HOME=/tmp
+    -e PWNLIB_NOTERM=1
+    -e JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8
+    -e PYTHONPATH=/opt/newminhh_patcher
+    "${DOCKER_MOUNTS[@]}"
+    "${RE_IMAGE}"
+    /opt/re-venv/bin/python3 -m re_patcher.cli
+    "${EXTRA_FLAGS[@]}"
+    "${CONTAINER_IN}"
+)
+
+if [[ -n "${CONTAINER_OUT}" ]]; then
+    DOCKER_CMD+=(-o "${CONTAINER_OUT}")
+fi
 
 set +e
-docker run --rm \
-    --user "$(id -u):$(id -g)" \
-    -e HOME=/tmp \
-    -e PWNLIB_NOTERM=1 \
-    -e JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8 \
-    -e PYTHONPATH=/opt/newminhh_patcher \
-    "${DOCKER_MOUNTS[@]}" \
-    "${RE_IMAGE}" \
-    /opt/re-venv/bin/python3 -m re_patcher.cli \
-        "${EXTRA_FLAGS[@]}" \
-        "${CONTAINER_IN}" -o "${CONTAINER_OUT}"
+"${DOCKER_CMD[@]}"
 RC=$?
 set -e
 
 if [[ ${RC} -ne 0 ]]; then
-    rm -f -- "${ABS_OUT}"
+    if [[ -n "${ABS_OUT}" ]]; then
+        rm -f -- "${ABS_OUT}"
+    fi
     exit "${RC}"
 fi
 
-if [[ ! -f "${ABS_OUT}" ]]; then
-    echo "[newminhh:patcher] ERROR: patcher reported success but output was not created: ${ABS_OUT}" >&2
-    exit 1
+if [[ -n "${ABS_OUT}" ]]; then
+    if [[ ! -f "${ABS_OUT}" ]]; then
+        echo "[newminhh:patcher] ERROR: patcher reported success but output was not created: ${ABS_OUT}" >&2
+        exit 1
+    fi
+    chmod +x -- "${ABS_OUT}"
 fi
-
-chmod +x -- "${ABS_OUT}"
 exit 0

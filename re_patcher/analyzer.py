@@ -207,6 +207,155 @@ class AnalysisResult:
     reachable_insns: Dict[int, capstone.CsInsn]
     func_classifications: Dict[int, str]  # func_va -> REWRITABLE_NATIVE | REQUIRES_DBT_FALLBACK
     max_vaddr: int
+    symbol_versions: List[Tuple[str, str, str]] = field(default_factory=list)  # (soname, sym_name, version)
+    sym_version_map: Dict[str, Tuple[str, str]] = field(default_factory=dict)  # sym_name -> (soname, version)
+
+
+CALLEE_SAVED_REGS = {
+    cs_x86.X86_REG_EBX,
+    cs_x86.X86_REG_ESI,
+    cs_x86.X86_REG_EDI,
+    cs_x86.X86_REG_EBP,
+}
+CALLER_SAVED_REGS = {
+    cs_x86.X86_REG_EAX,
+    cs_x86.X86_REG_ECX,
+    cs_x86.X86_REG_EDX,
+}
+
+
+class GotProvenanceTracker:
+    """Tracks which register(s) currently hold the GOT base VA (got_va)."""
+
+    def __init__(self, got_va: int, pic_thunks: Dict[int, str], functions: Set[int]):
+        self.got_va = got_va
+        self.pic_thunks = pic_thunks
+        self.functions = functions
+        self.got_regs: Set[int] = set()
+        self.func_got_reg: Optional[int] = None
+        self.pending_pc: Dict[int, int] = {}  # reg_id -> pc_va
+
+    def is_got_reg(self, reg_id: int) -> bool:
+        if self.got_va == 0:
+            return False
+        return (reg_id in self.got_regs) or (self.func_got_reg is not None and reg_id == self.func_got_reg)
+
+    def on_instruction(
+        self, insn: capstone.CsInsn, next_insn: Optional[capstone.CsInsn] = None
+    ) -> None:
+        if self.got_va == 0:
+            return
+
+        # Start of genuine function boundary clears provenance (never clear on `call $+5; pop %reg` landing pad)
+        if insn.address in self.functions and insn.address not in self.pending_pc.values():
+            self.got_regs.clear()
+            self.pending_pc.clear()
+            self.func_got_reg = None
+
+        # Call __x86.get_pc_thunk.<reg> or inline call $+5
+        if insn.id == cs_x86.X86_INS_CALL:
+            if len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
+                tgt = insn.operands[0].imm & 0xFFFFFFFF
+                if tgt in self.pic_thunks:
+                    rname = self.pic_thunks[tgt]
+                    cs_reg = {
+                        "eax": cs_x86.X86_REG_EAX,
+                        "ecx": cs_x86.X86_REG_ECX,
+                        "edx": cs_x86.X86_REG_EDX,
+                        "ebx": cs_x86.X86_REG_EBX,
+                        "esp": cs_x86.X86_REG_ESP,
+                        "ebp": cs_x86.X86_REG_EBP,
+                        "esi": cs_x86.X86_REG_ESI,
+                        "edi": cs_x86.X86_REG_EDI,
+                    }.get(rname)
+                    if cs_reg is not None:
+                        self.pending_pc[cs_reg] = (insn.address + insn.size) & 0xFFFFFFFF
+                    return
+                elif (insn.operands[0].imm & 0xFFFFFFFF) == (insn.address + insn.size):
+                    # call $+5; next insn is pop %reg
+                    if (
+                        next_insn is not None
+                        and next_insn.id == cs_x86.X86_INS_POP
+                        and len(next_insn.operands) == 1
+                        and next_insn.operands[0].type == cs_x86.X86_OP_REG
+                    ):
+                        self.pending_pc[next_insn.operands[0].reg] = (
+                            insn.address + insn.size
+                        ) & 0xFFFFFFFF
+                    return
+            # Caller-saved registers are clobbered by calls — NEVER invalidate callee-saved regs!
+            for r in CALLER_SAVED_REGS:
+                self.got_regs.discard(r)
+                self.pending_pc.pop(r, None)
+            return
+
+        # Pop into register (if not handled by call $+5)
+        if insn.id == cs_x86.X86_INS_POP and len(insn.operands) == 1:
+            op = insn.operands[0]
+            if op.type == cs_x86.X86_OP_REG:
+                if op.reg not in self.pending_pc:
+                    self.got_regs.discard(op.reg)
+                    if op.reg == self.func_got_reg:
+                        self.func_got_reg = None
+            return
+
+        # add $imm, %reg
+        if insn.id == cs_x86.X86_INS_ADD and len(insn.operands) == 2:
+            dst, src = insn.operands[0], insn.operands[1]
+            if dst.type == cs_x86.X86_OP_REG:
+                if src.type == cs_x86.X86_OP_IMM:
+                    imm = src.imm & 0xFFFFFFFF
+                    if dst.reg in self.pending_pc:
+                        pc_val = self.pending_pc.pop(dst.reg)
+                        if ((pc_val + imm) & 0xFFFFFFFF) == self.got_va:
+                            self.got_regs.add(dst.reg)
+                            if dst.reg in CALLEE_SAVED_REGS:
+                                self.func_got_reg = dst.reg
+                    elif dst.reg in self.got_regs:
+                        if imm != 0:
+                            self.got_regs.discard(dst.reg)
+                            if dst.reg == self.func_got_reg:
+                                self.func_got_reg = None
+                else:
+                    self.got_regs.discard(dst.reg)
+                    self.pending_pc.pop(dst.reg, None)
+                    if dst.reg == self.func_got_reg:
+                        self.func_got_reg = None
+            return
+
+        # mov %got_reg, %reg (register copy)
+        if insn.id == cs_x86.X86_INS_MOV and len(insn.operands) == 2:
+            dst, src = insn.operands[0], insn.operands[1]
+            if dst.type == cs_x86.X86_OP_REG:
+                if src.type == cs_x86.X86_OP_REG and self.is_got_reg(src.reg):
+                    self.got_regs.add(dst.reg)
+                else:
+                    self.got_regs.discard(dst.reg)
+                    if dst.reg == self.func_got_reg:
+                        self.func_got_reg = None
+                self.pending_pc.pop(dst.reg, None)
+            return
+
+        # On jmp / jcc / ret: NEVER invalidate callee-saved GOT registers!
+        if insn.id in (
+            cs_x86.X86_INS_JMP,
+            cs_x86.X86_INS_RET,
+            cs_x86.X86_INS_RETF,
+        ) or (insn.mnemonic.startswith("j") and insn.mnemonic != "jmp"):
+            for r in CALLER_SAVED_REGS:
+                self.got_regs.discard(r)
+                self.pending_pc.pop(r, None)
+            if insn.id in (cs_x86.X86_INS_RET, cs_x86.X86_INS_RETF):
+                self.func_got_reg = None
+            return
+
+        # Any other instruction writing to operand 0 register invalidates it
+        if insn.id not in (cs_x86.X86_INS_CMP, cs_x86.X86_INS_TEST, cs_x86.X86_INS_PUSH):
+            if len(insn.operands) > 0 and insn.operands[0].type == cs_x86.X86_OP_REG:
+                self.got_regs.discard(insn.operands[0].reg)
+                self.pending_pc.pop(insn.operands[0].reg, None)
+                if insn.operands[0].reg == self.func_got_reg:
+                    self.func_got_reg = None
 
 
 def _vaddr_to_bytes(phdrs: List[PhdrInfo], data: bytes, va: int, size: int) -> Optional[bytes]:
@@ -266,8 +415,13 @@ def _is_forbidden_insn(insn: capstone.CsInsn) -> Optional[str]:
 
 
 def _run_r2_analysis(path: str, verbose: bool = False) -> Tuple[Set[int], Dict[int, List[int]]]:
-    """Run radare2 headless analysis (`aaa; aflj`) for stripped binaries / CFG corroboration."""
-    r2_bin = shutil.which("r2") or shutil.which("radare2")
+    """Run radare2 / rizin headless analysis (`aaa; aflj`) for stripped binaries / CFG corroboration."""
+    r2_bin = (
+        shutil.which("rizin")
+        or ("/usr/bin/rizin" if os.path.exists("/usr/bin/rizin") else None)
+        or shutil.which("r2")
+        or shutil.which("radare2")
+    )
     if not r2_bin:
         return set(), {}
     funcs: Set[int] = set()
@@ -478,14 +632,20 @@ def analyze_binary(
             if b is not None:
                 dynstr_bytes = b
 
-        def _get_dynstr(off: int) -> str:
-            if off >= len(dynstr_bytes):
-                return ""
-            end = dynstr_bytes.find(b"\x00", off)
-            if end < 0:
-                end = len(dynstr_bytes)
-            return dynstr_bytes[off:end].decode("ascii", errors="replace")
+    if not dynstr_bytes:
+        dynstr_sec = elf.get_section_by_name(".dynstr")
+        if dynstr_sec is not None:
+            dynstr_bytes = dynstr_sec.data()
 
+    def _get_dynstr(off: int) -> str:
+        if off >= len(dynstr_bytes):
+            return ""
+        end = dynstr_bytes.find(b"\x00", off)
+        if end < 0:
+            end = len(dynstr_bytes)
+        return dynstr_bytes[off:end].decode("ascii", errors="replace")
+
+    if dyn_ph is not None:
         dt_needed = [_get_dynstr(int(x)) for x in dt_needed]
 
         # Parse .dynsym
@@ -534,6 +694,60 @@ def analyze_binary(
         if 23 in dyn_tags and 2 in dyn_tags:
             rel_plt = _parse_rel_table(dyn_tags[23], dyn_tags[2], 8)
 
+    # Parse ELF symbol versioning (.gnu.versym, .gnu.verneed / SHT_GNU_verneed)
+    versym_sec = elf.get_section_by_name(".gnu.versym")
+    verneed_sec = elf.get_section_by_name(".gnu.verneed")
+    versym_data = versym_sec.data() if versym_sec is not None else b""
+    verneed_data = verneed_sec.data() if verneed_sec is not None else b""
+
+    if not verneed_data and 0x6FFFFFFE in dyn_tags:  # DT_VERNEED
+        vn_va = dyn_tags[0x6FFFFFFE]
+        b = _vaddr_to_bytes(phdrs, raw_bytes, vn_va, 4096)
+        if b:
+            verneed_data = b
+    if not versym_data and 0x6FFFFFF0 in dyn_tags:  # DT_VERSYM
+        vs_va = dyn_tags[0x6FFFFFF0]
+        vs_sz = len(dynsyms) * 2
+        b = _vaddr_to_bytes(phdrs, raw_bytes, vs_va, vs_sz)
+        if b:
+            versym_data = b
+
+    ver_map: Dict[int, Tuple[str, str]] = {}
+    if verneed_data and dynstr_bytes:
+        pos = 0
+        while pos + 16 <= len(verneed_data):
+            vn_version, vn_cnt, vn_file, vn_aux, vn_next = struct.unpack_from("<HHIII", verneed_data, pos)
+            soname = _get_dynstr(vn_file)
+            aux_pos = pos + vn_aux
+            for _ in range(vn_cnt):
+                if aux_pos + 16 > len(verneed_data):
+                    break
+                vna_hash, vna_flags, vna_other, vna_name, vna_next = struct.unpack_from(
+                    "<IHHI I", verneed_data, aux_pos
+                )
+                v_idx = vna_other & 0x7FFF
+                v_name = _get_dynstr(vna_name)
+                ver_map[v_idx] = (soname, v_name)
+                if vna_next == 0:
+                    break
+                aux_pos += vna_next
+            if vn_next == 0:
+                break
+            pos += vn_next
+
+    symbol_versions: List[Tuple[str, str, str]] = []
+    sym_version_map: Dict[str, Tuple[str, str]] = {}
+    if versym_data and ver_map:
+        vs_count = len(versym_data) // 2
+        for s_idx in range(min(len(dynsyms), vs_count)):
+            sym = dynsyms[s_idx]
+            v_val = struct.unpack_from("<H", versym_data, s_idx * 2)[0]
+            v_idx = v_val & 0x7FFF
+            if sym.name and v_idx in ver_map:
+                soname, ver_str = ver_map[v_idx]
+                symbol_versions.append((soname, sym.name, ver_str))
+                sym_version_map[sym.name] = (soname, ver_str)
+
     # Identify GOT / GOT.PLT VA
     got_plt_va = dyn_tags.get(3, 0)
     got_sec = elf.get_section_by_name(".got")
@@ -569,18 +783,36 @@ def analyze_binary(
                         slot_va = (got_va + mem.disp) & 0xFFFFFFFF
                     if slot_va is not None:
                         rel = jmp_slot_by_got.get(slot_va) or glob_dat_by_got.get(slot_va)
-                        if rel is not None and rel.sym_name:
-                            plt_stubs[insn.address] = PltStubInfo(
-                                va=insn.address,
-                                size=16 if plt_name == ".plt" else insn.size,
-                                sym_name=rel.sym_name,
-                                got_slot_va=slot_va,
-                            )
+                        if rel is not None:
+                            sname = rel.sym_name or (f"__nm_ifunc_{slot_va:x}" if rel.r_type == 42 else "")
+                            if sname:
+                                plt_stubs[insn.address] = PltStubInfo(
+                                    va=insn.address,
+                                    size=16 if plt_name == ".plt" else insn.size,
+                                    sym_name=sname,
+                                    got_slot_va=slot_va,
+                                )
 
     # Extract init / fini / init_array / fini_array
     init_va = dyn_tags.get(12, 0)
     fini_va = dyn_tags.get(13, 0)
     rel_dyn_map = {r.offset: r for r in rel_dyn}
+
+    # If DT_INIT_ARRAY (25) or DT_INIT_ARRAYSZ (27) missing, check section headers
+    if 25 not in dyn_tags or 27 not in dyn_tags:
+        for sh in shdrs:
+            if (sh.name == ".init_array" or sh.sh_type == 14) and sh.sh_size > 0:
+                dyn_tags[25] = sh.sh_addr
+                dyn_tags[27] = sh.sh_size
+                break
+
+    # If DT_FINI_ARRAY (26) or DT_FINI_ARRAYSZ (28) missing, check section headers
+    if 26 not in dyn_tags or 28 not in dyn_tags:
+        for sh in shdrs:
+            if (sh.name == ".fini_array" or sh.sh_type == 15) and sh.sh_size > 0:
+                dyn_tags[26] = sh.sh_addr
+                dyn_tags[28] = sh.sh_size
+                break
 
     def _read_ptr_array(arr_tag: int, sz_tag: int) -> List[int]:
         res: List[int] = []
@@ -685,6 +917,19 @@ def analyze_binary(
                 if _in_code(tgt) and tgt != va + insn.size:
                     functions.add(tgt)
 
+    # Strip false-positive `call $+5; pop %reg` landing pads reported as functions by rizin/angr
+    false_call_next_vas: Set[int] = set()
+    for va, insn in all_code_insns.items():
+        if insn.id == cs_x86.X86_INS_CALL and len(insn.operands) == 1:
+            op = insn.operands[0]
+            if op.type == cs_x86.X86_OP_IMM:
+                tgt = op.imm & 0xFFFFFFFF
+                if tgt == (va + insn.size) & 0xFFFFFFFF:
+                    false_call_next_vas.add(tgt)
+    for fva in false_call_next_vas:
+        if fva != e_entry and fva not in sym_names and fva not in init_array and fva not in fini_array:
+            functions.discard(fva)
+
     # Detect PIC thunks: function starting with `mov (%esp), %reg32; ret`
     pic_thunks: Dict[int, str] = {}
     for fva in sorted(functions):
@@ -717,20 +962,99 @@ def analyze_binary(
     va_to_idx = {va: idx for idx, va in enumerate(sorted_vas)}
 
     def _infer_bound(jmp_idx: int, idx_reg: int) -> Optional[int]:
-        # Scan up to 8 preceding instructions for `cmp $N, %idx` or `and $mask, %idx`
-        for k in range(jmp_idx - 1, max(-1, jmp_idx - 10), -1):
+        # Forward value-numbering over [max(0, jmp_idx - 16), jmp_idx]
+        start_k = max(0, jmp_idx - 16)
+        val_id: Dict[int, int] = {}
+        next_vid = 10000
+
+        def alloc_val() -> int:
+            nonlocal next_vid
+            v = next_vid
+            next_vid += 1
+            return v
+
+        bound_by_val: Dict[int, int] = {}
+
+        for k in range(start_k, jmp_idx):
             pi = all_code_insns[sorted_vas[k]]
-            if pi.id == cs_x86.X86_INS_CMP and len(pi.operands) == 2:
-                if pi.operands[0].type == cs_x86.X86_OP_REG and pi.operands[0].reg == idx_reg:
-                    if pi.operands[1].type == cs_x86.X86_OP_IMM:
-                        return int(pi.operands[1].imm & 0xFFFFFFFF) + 1
-            if pi.id == cs_x86.X86_INS_AND and len(pi.operands) == 2:
-                if pi.operands[0].type == cs_x86.X86_OP_REG and pi.operands[0].reg == idx_reg:
-                    if pi.operands[1].type == cs_x86.X86_OP_IMM:
-                        mask = int(pi.operands[1].imm & 0xFFFFFFFF)
-                        if mask > 0 and (mask & (mask + 1)) == 0 and mask <= 255:
-                            return mask + 1
-        return None
+
+            # On mov/movzx/movsx dst_reg, src_reg: val_id[dst_reg] = val_id[src_reg]
+            if (
+                pi.id in (cs_x86.X86_INS_MOV, cs_x86.X86_INS_MOVZX, cs_x86.X86_INS_MOVSX)
+                and len(pi.operands) == 2
+                and pi.operands[0].type == cs_x86.X86_OP_REG
+                and pi.operands[1].type == cs_x86.X86_OP_REG
+            ):
+                dst = pi.operands[0].reg
+                src = pi.operands[1].reg
+                val_id[dst] = val_id.get(src, src)
+                continue
+
+            # On cmp reg, imm: record bound_by_val[val_id[reg]] = (imm & 0xFFFFFFFF) + 1
+            if (
+                pi.id == cs_x86.X86_INS_CMP
+                and len(pi.operands) == 2
+                and pi.operands[0].type == cs_x86.X86_OP_REG
+                and pi.operands[1].type == cs_x86.X86_OP_IMM
+            ):
+                reg = pi.operands[0].reg
+                bound_by_val[val_id.get(reg, reg)] = int(pi.operands[1].imm & 0xFFFFFFFF) + 1
+                continue
+
+            # On and reg, imm where mask = imm & 0xFFFFFFFF is 2^k - 1 <= 255:
+            # assign new val_id[reg] and record bound_by_val[new_id] = mask + 1
+            if (
+                pi.id == cs_x86.X86_INS_AND
+                and len(pi.operands) == 2
+                and pi.operands[0].type == cs_x86.X86_OP_REG
+                and pi.operands[1].type == cs_x86.X86_OP_IMM
+            ):
+                mask = int(pi.operands[1].imm & 0xFFFFFFFF)
+                if mask > 0 and (mask & (mask + 1)) == 0 and mask <= 255:
+                    new_id = alloc_val()
+                    val_id[pi.operands[0].reg] = new_id
+                    bound_by_val[new_id] = mask + 1
+                    continue
+
+            # On call imm: if target == pi.address + pi.size (inline call $+5) do NOT clobber any registers;
+            # if target in pic_thunks, only invalidate that thunk's target register;
+            # otherwise invalidate caller-saved EAX, ECX, EDX.
+            if pi.id == cs_x86.X86_INS_CALL:
+                if len(pi.operands) == 1 and pi.operands[0].type == cs_x86.X86_OP_IMM:
+                    target = pi.operands[0].imm & 0xFFFFFFFF
+                    if target == (pi.address + pi.size) & 0xFFFFFFFF:
+                        continue
+                    if target in pic_thunks:
+                        thunk_rname = pic_thunks[target]
+                        thunk_reg = {
+                            "eax": cs_x86.X86_REG_EAX,
+                            "ecx": cs_x86.X86_REG_ECX,
+                            "edx": cs_x86.X86_REG_EDX,
+                            "ebx": cs_x86.X86_REG_EBX,
+                            "esp": cs_x86.X86_REG_ESP,
+                            "ebp": cs_x86.X86_REG_EBP,
+                            "esi": cs_x86.X86_REG_ESI,
+                            "edi": cs_x86.X86_REG_EDI,
+                        }.get(thunk_rname)
+                        if thunk_reg is not None:
+                            val_id[thunk_reg] = alloc_val()
+                        continue
+                for reg in (cs_x86.X86_REG_EAX, cs_x86.X86_REG_ECX, cs_x86.X86_REG_EDX):
+                    val_id[reg] = alloc_val()
+                continue
+
+            # On any other instruction modifying operands[0] when it is a register
+            # (excluding CMP, TEST, PUSH, JMP, Jcc): assign a fresh val_id to operands[0].reg
+            if (
+                pi.id in (cs_x86.X86_INS_CMP, cs_x86.X86_INS_TEST, cs_x86.X86_INS_PUSH)
+                or pi.mnemonic.startswith("j")
+            ):
+                continue
+
+            if len(pi.operands) > 0 and pi.operands[0].type == cs_x86.X86_OP_REG:
+                val_id[pi.operands[0].reg] = alloc_val()
+
+        return bound_by_val.get(val_id.get(idx_reg, idx_reg))
 
     for va in sorted_vas:
         insn = all_code_insns[va]
@@ -799,6 +1123,17 @@ def analyze_binary(
                 bound = _infer_bound(jidx - 1, idx_reg)
                 if bound is None and va in angr_jump_tables:
                     bound = len(angr_jump_tables[va])
+                if bound is None:
+                    # Probe consecutive valid code targets
+                    bound = 0
+                    while bound < 256:
+                        rel = _read_i32(phdrs, raw_bytes, tbl_va + bound * 4)
+                        if rel is None:
+                            break
+                        t = (got_va + rel) & 0xFFFFFFFF
+                        if not _in_code(t):
+                            break
+                        bound += 1
                 targets = []
                 if bound and bound > 0:
                     for i in range(bound):
@@ -844,6 +1179,17 @@ def analyze_binary(
                     bound = _infer_bound(jidx - 2, idx_reg)
                     if bound is None and va in angr_jump_tables:
                         bound = len(angr_jump_tables[va])
+                    if bound is None:
+                        # Probe consecutive valid code targets
+                        bound = 0
+                        while bound < 256:
+                            rel = _read_i32(phdrs, raw_bytes, tbl_va + bound * 4)
+                            if rel is None:
+                                break
+                            t = (got_va + rel) & 0xFFFFFFFF
+                            if not _in_code(t):
+                                break
+                            bound += 1
                     targets = []
                     if bound and bound > 0:
                         for i in range(bound):
@@ -867,7 +1213,6 @@ def analyze_binary(
 
     # Reachability traversal (CFG worklist from all known entry points & functions)
     # This validates every reachable instruction against N07/N08 and identifies syscalls.
-    worklist: List[int] = sorted(functions)
     visited_insns: Dict[int, capstone.CsInsn] = {}
     syscalls: Dict[int, str] = {}
     unresolved_indirect_jmps: Set[int] = set()
@@ -887,33 +1232,35 @@ def analyze_binary(
         return False
 
     # Also detect address-taken functions via `lea disp(%got_reg), %reg` or `push/mov $imm`
-    for va, insn in all_code_insns.items():
+    tracker = GotProvenanceTracker(got_va, pic_thunks, functions)
+    sorted_all_vas = sorted(all_code_insns.keys())
+    for s_i, va in enumerate(sorted_all_vas):
+        insn = all_code_insns[va]
+        next_insn = all_code_insns.get(sorted_all_vas[s_i + 1]) if s_i + 1 < len(sorted_all_vas) else None
         if insn.id == cs_x86.X86_INS_LEA and len(insn.operands) == 2:
             op1 = insn.operands[1]
-            if op1.type == cs_x86.X86_OP_MEM and op1.mem.index == cs_x86.X86_REG_INVALID and got_va != 0:
-                if op1.mem.base in (
-                    cs_x86.X86_REG_EBX,
-                    cs_x86.X86_REG_ECX,
-                    cs_x86.X86_REG_EDX,
-                    cs_x86.X86_REG_ESI,
-                    cs_x86.X86_REG_EDI,
-                    cs_x86.X86_REG_EAX,
-                ):
-                    cand = (got_va + op1.mem.disp) & 0xFFFFFFFF
-                    if _in_code(cand) and cand in all_code_insns:
-                        functions.add(cand)
-                        addr_taken_funcs.add(cand)
+            if (
+                op1.type == cs_x86.X86_OP_MEM
+                and op1.mem.index == cs_x86.X86_REG_INVALID
+                and tracker.is_got_reg(op1.mem.base)
+            ):
+                cand = (got_va + op1.mem.disp) & 0xFFFFFFFF
+                if _in_code(cand) and cand in all_code_insns:
+                    functions.add(cand)
+                    addr_taken_funcs.add(cand)
         elif e_type == 2:  # ET_EXEC immediate function pointer
             for op in insn.operands:
                 if op.type == cs_x86.X86_OP_IMM:
                     cand = op.imm & 0xFFFFFFFF
                     if cand in functions:
                         addr_taken_funcs.add(cand)
+        tracker.on_instruction(insn, next_insn)
 
     for s in init_array + fini_array:
         if _in_code(s):
             addr_taken_funcs.add(s)
 
+    worklist: List[int] = sorted(functions)
     seen_va: Set[int] = set()
     while worklist:
         cur_va = worklist.pop()
@@ -1062,4 +1409,6 @@ def analyze_binary(
         reachable_insns=visited_insns,
         func_classifications=func_classifications,
         max_vaddr=max_vaddr,
+        symbol_versions=symbol_versions,
+        sym_version_map=sym_version_map,
     )

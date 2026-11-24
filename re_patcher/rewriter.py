@@ -10,7 +10,7 @@ import capstone
 from capstone import x86 as cs_x86
 
 from . import PatcherError
-from .analyzer import AnalysisResult, JumpTableInfo
+from .analyzer import AnalysisResult, GotProvenanceTracker, JumpTableInfo
 
 REG32_IDX: Dict[int, int] = {
     cs_x86.X86_REG_EAX: 0,
@@ -21,6 +21,13 @@ REG32_IDX: Dict[int, int] = {
     cs_x86.X86_REG_EBP: 5,
     cs_x86.X86_REG_ESI: 6,
     cs_x86.X86_REG_EDI: 7,
+}
+
+HI8_XCHG: Dict[int, bytes] = {
+    cs_x86.X86_REG_AH: b"\x86\xc4",  # xchg %al, %ah
+    cs_x86.X86_REG_CH: b"\x86\xcd",  # xchg %cl, %ch
+    cs_x86.X86_REG_DH: b"\x86\xd6",  # xchg %dl, %dh
+    cs_x86.X86_REG_BH: b"\x86\xdf",  # xchg %bl, %bh
 }
 
 REG32_NAME_TO_IDX: Dict[str, int] = {
@@ -131,7 +138,9 @@ def _fix_modrm_disp32_and_addr32(
     return bytes(buf)
 
 
-def _rewrite_rm32_mov_r11d(insn: capstone.CsInsn, store_to_mem: bool) -> bytes:
+def _rewrite_rm32_mov_r11d(
+    insn: capstone.CsInsn, store_to_mem: bool, has_imm32: bool = False
+) -> bytes:
     """Emit `movl <r/m32>, %r11d` (store_to_mem=False) or `movl %r11d, <r/m32>` (True)."""
     raw = bytearray(insn.bytes)
     modrm_off = insn.encoding.modrm_offset
@@ -146,7 +155,7 @@ def _rewrite_rm32_mov_r11d(insn: capstone.CsInsn, store_to_mem: bool) -> bytes:
     modrm = raw[modrm_off]
     mod = (modrm >> 6) & 3
     rm = modrm & 7
-    tail = bytearray(raw[modrm_off:])
+    tail = bytearray(raw[modrm_off:-4] if has_imm32 else raw[modrm_off:])
     tail[0] = (modrm & 0xC7) | (3 << 3)  # reg = 3 -> %r11d with REX.R
     if mod == 0 and rm == 5:
         tail[0] = (0 << 6) | (3 << 3) | 4
@@ -222,9 +231,30 @@ def _rewrite_gs_insn(insn: capstone.CsInsn) -> bytes:
             mod = (modrm >> 6) & 3
             reg = (modrm >> 3) & 7
             orig_rm = modrm & 7
+
+            # Check if instruction has a hi8 register operand (ah, ch, dh, bh)
+            hi8_reg = next(
+                (op.reg for op in insn.operands if op.type == cs_x86.X86_OP_REG and op.reg in HI8_XCHG),
+                None,
+            )
+
             # If original had SIB (orig_rm == 4, e.g. (%esp)), drop the SIB byte
             if orig_rm == 4 and modrm_off + 1 < len(buf):
                 del buf[modrm_off + 1]
+
+            if hi8_reg is not None:
+                # hi8 reg (ah=4, ch=5, dh=6, bh=7) conflicts with REX prefix in Long Mode.
+                # Remap ModRM reg to low8 register (al=0, cl=1, dl=2, bl=3) and wrap
+                # with xchg %r_low, %hi8 (which preserves EFLAGS and all other registers).
+                xchg_seq = HI8_XCHG[hi8_reg]
+                new_reg = reg & 3
+                buf[modrm_off] = (mod << 6) | (new_reg << 3) | 3  # rm = 3 -> %r11 with REX.B
+                op_off = 0
+                while op_off < modrm_off and buf[op_off] in (0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3):
+                    op_off += 1
+                buf.insert(op_off, 0x41)  # REX.B
+                return pre + xchg_seq + bytes(buf) + xchg_seq
+
             buf[modrm_off] = (mod << 6) | (reg << 3) | 3  # rm = 3 -> %r11 with REX.B
             # Insert REX.B (0x41) right before opcode (after prefix bytes)
             op_off = 0
@@ -277,6 +307,16 @@ def rewrite_binary(
             slot_idx = 3 + len(plt_entries)
             seen_plt_syms[st.sym_name] = slot_idx
             plt_entries.append((st.sym_name, st.got_slot_va, slot_idx))
+
+    # Also include address-taken imported functions in rel_dyn so they receive canonical PLT stubs
+    for r in analysis.rel_dyn:
+        if r.sym_name and r.r_type in (1, 6) and r.sym_name not in seen_plt_syms:
+            if r.sym_idx < len(analysis.dynsyms):
+                sym = analysis.dynsyms[r.sym_idx]
+                if sym.st_shndx == 0 and sym.sym_type == 2 and sym.bind == 1:  # strictly STB_GLOBAL and STT_FUNC
+                    slot_idx = 3 + len(plt_entries)
+                    seen_plt_syms[r.sym_name] = slot_idx
+                    plt_entries.append((r.sym_name, 0, slot_idx))
 
     fallback_funcs: List[Tuple[str, int]] = []
     fallback_va_set = set()
@@ -341,419 +381,724 @@ def rewrite_binary(
         jt.replace_start_va: jt for jt in analysis.jump_tables.values()
     }
 
-    # Build linear list of instructions per CodeRange
+    got_tracker = GotProvenanceTracker(
+        analysis.got_va, analysis.pic_thunks, analysis.functions
+    )
+
+    # Collect known CFG/function/branch targets for resilient disassembly
+    known_targets: Set[int] = set(analysis.functions)
+    known_targets.update(analysis.reachable_insns.keys())
+    known_targets.update(analysis.addr_taken_funcs)
+    for jt in analysis.jump_tables.values():
+        known_targets.update(jt.targets)
+    if analysis.e_entry:
+        known_targets.add(analysis.e_entry)
+    if analysis.init_va:
+        known_targets.add(analysis.init_va)
+    if analysis.fini_va:
+        known_targets.add(analysis.fini_va)
+    for a in analysis.init_array + analysis.fini_array:
+        known_targets.add(a)
+
+    discovered_targets: Set[int] = set(known_targets)
     for cr in analysis.code_ranges:
-        insns = list(md.disasm(cr.data, cr.va))
-        idx = 0
-        while idx < len(insns):
-            insn = insns[idx]
-            va = insn.address
-            cur_new_va = base_va + len(code_buf)
-            orig_to_new[va] = cur_new_va
+        for insn in md.disasm(cr.data, cr.va):
+            if insn.id in (
+                cs_x86.X86_INS_JMP, cs_x86.X86_INS_CALL, cs_x86.X86_INS_LOOP,
+                cs_x86.X86_INS_JCXZ, cs_x86.X86_INS_JECXZ,
+            ) or insn.id in JCC_SHORT_MAP:
+                if len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
+                    imm = insn.operands[0].imm & 0xFFFFFFFF
+                    if any(c.va <= imm < c.va + len(c.data) for c in analysis.code_ranges):
+                        discovered_targets.add(imm)
 
-            # Check if this function entry is marked REQUIRES_DBT_FALLBACK
-            if va in fallback_va_set:
-                lbl = f"__nm_fb_{va:08x}"
-                patch_off = len(code_buf) + 1
-                code_buf.extend(b"\xe9\x00\x00\x00\x00")
-                label_fixups.append((patch_off, cur_new_va + 5, lbl))
-                idx += 1
-                continue
+    def _check_and_emit_inline_data_after_uncond(insn_obj: capstone.CsInsn, cr_obj: CodeRange) -> Optional[int]:
+        if insn_obj.id not in (
+            cs_x86.X86_INS_JMP,
+            cs_x86.X86_INS_RET,
+            cs_x86.X86_INS_RETF,
+            cs_x86.X86_INS_UD2,
+            cs_x86.X86_INS_HLT,
+        ):
+            return None
+        next_va = insn_obj.address + insn_obj.size
+        if next_va < cr_obj.va + len(cr_obj.data) and next_va not in discovered_targets:
+            ahead_t = [t for t in discovered_targets if next_va < t <= cr_obj.va + len(cr_obj.data)]
+            if ahead_t:
+                next_t = min(ahead_t)
+                cur_off = next_va - cr_obj.va
+                target_off = next_t - cr_obj.va
+                while cur_off < target_off:
+                    b_va = cr_obj.va + cur_off
+                    orig_to_new[b_va] = base_va + len(code_buf)
+                    code_buf.append(cr_obj.data[cur_off])
+                    cur_off += 1
+                return target_off
+        return None
 
-            # 1. Jump table replacement span
-            if va in jt_by_start:
-                jt = jt_by_start[va]
-                idx_r = REG32_IDX.get(jt.idx_reg, 0)
-                jt_blob = JumpTableBlob(rodata_offset=rodata_off, targets=list(jt.targets))
-                jump_table_blobs.append(jt_blob)
-                rodata_off += len(jt.targets) * 4
+    # Build linear list of instructions per CodeRange using resilient chunked disassembly
+    for cr in analysis.code_ranges:
+        cr_off = 0
+        cr_len = len(cr.data)
+        while cr_off < cr_len:
+            insns = list(md.disasm(cr.data[cr_off:], cr.va + cr_off))
+            if insns:
+                idx = 0
+                broke_for_data = False
+                while idx < len(insns):
+                    insn = insns[idx]
+                    va = insn.address
+                    end_va = va + insn.size
 
-                # leal jt(%rip), %r11d (7B)
-                # movl %idx32, %r10d    (3B: 41 89 <0xC2 | idx_r<<3>)
-                # addl (%r11,%r10,4), %r11d (4B: 47 03 1c 93)
-                # jmp *%r11             (3B: 41 ff e3)
-                patch_off = len(code_buf) + 3
-                code_buf.extend(_emit_lea_rip_to_r11d(0))
-                rodata_fixups.append((patch_off, cur_new_va + 7, jt_blob.rodata_offset))
-                code_buf.extend(bytes([0x41, 0x89, 0xC2 | (idx_r << 3)]))
-                code_buf.extend(b"\x47\x03\x1c\x93")
-                code_buf.extend(b"\x41\xff\xe3")
+                    # Check if insn straddles a discovered target (addr < t < addr + size)
+                    straddled_t = None
+                    for t in discovered_targets:
+                        if va < t < end_va:
+                            if straddled_t is None or t < straddled_t:
+                                straddled_t = t
 
-                while idx < len(insns) and insns[idx].address < jt.replace_end_va:
-                    if insns[idx].address not in orig_to_new:
-                        orig_to_new[insns[idx].address] = cur_new_va
-                    idx += 1
-                continue
+                    if straddled_t is not None:
+                        # Do NOT emit that straddling instruction!
+                        # Emit raw bytes from va up to straddled_t as inline data
+                        cur_off = va - cr.va
+                        target_off = straddled_t - cr.va
+                        while cur_off < target_off:
+                            b_va = cr.va + cur_off
+                            orig_to_new[b_va] = base_va + len(code_buf)
+                            code_buf.append(cr.data[cur_off])
+                            cur_off += 1
+                        cr_off = target_off
+                        broke_for_data = True
+                        break
 
-            # 2. Inline `call $+5; pop %reg` PIC idiom
-            if (
-                insn.id == cs_x86.X86_INS_CALL
-                and len(insn.operands) == 1
-                and insn.operands[0].type == cs_x86.X86_OP_IMM
-                and (insn.operands[0].imm & 0xFFFFFFFF) == va + insn.size
-                and idx + 1 < len(insns)
-                and insns[idx + 1].id == cs_x86.X86_INS_POP
-                and len(insns[idx + 1].operands) == 1
-                and insns[idx + 1].operands[0].type == cs_x86.X86_OP_REG
-            ):
-                pop_insn = insns[idx + 1]
-                r_idx = REG32_IDX.get(pop_insn.operands[0].reg)
-                if r_idx is not None:
-                    orig_pc = pop_insn.address
-                    # leal (orig_pc - (cur_new_va + 6))(%rip), %reg32
-                    disp = (orig_pc - (cur_new_va + 6)) & 0xFFFFFFFF
-                    if disp >= 0x80000000:
-                        disp -= 0x100000000
-                    code_buf.extend(_emit_lea_rip_to_reg32(r_idx, disp))
-                    orig_to_new[pop_insn.address] = cur_new_va
-                    idx += 2
-                    continue
+                    cur_new_va = base_va + len(code_buf)
+                    orig_to_new[va] = cur_new_va
+                    next_insn = insns[idx + 1] if idx + 1 < len(insns) else None
 
-            # 3. `call __x86.get_pc_thunk.<reg>`
-            if insn.id == cs_x86.X86_INS_CALL and len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
-                tgt = insn.operands[0].imm & 0xFFFFFFFF
-                if tgt in analysis.pic_thunks:
-                    r_idx = REG32_NAME_TO_IDX[analysis.pic_thunks[tgt]]
-                    orig_ret = va + insn.size
-                    disp = (orig_ret - (cur_new_va + 6)) & 0xFFFFFFFF
-                    if disp >= 0x80000000:
-                        disp -= 0x100000000
-                    code_buf.extend(_emit_lea_rip_to_reg32(r_idx, disp))
-                    idx += 1
-                    continue
+                    # Dynamically update discovered_targets from branch instructions
+                    if insn.id in (
+                        cs_x86.X86_INS_JMP, cs_x86.X86_INS_CALL, cs_x86.X86_INS_LOOP,
+                        cs_x86.X86_INS_JCXZ, cs_x86.X86_INS_JECXZ,
+                    ) or insn.id in JCC_SHORT_MAP:
+                        if len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
+                            imm = insn.operands[0].imm & 0xFFFFFFFF
+                            if cr.va <= imm < cr.va + cr_len:
+                                discovered_targets.add(imm)
 
-            # 4. GOTOFF function pointer: `lea disp(%got_reg), %dst_reg`
-            if (
-                insn.id == cs_x86.X86_INS_LEA
-                and len(insn.operands) == 2
-                and insn.operands[0].type == cs_x86.X86_OP_REG
-                and insn.operands[1].type == cs_x86.X86_OP_MEM
-                and insn.operands[1].mem.index == cs_x86.X86_REG_INVALID
-                and analysis.got_va != 0
-                and insn.operands[1].mem.base in REG32_IDX
-                and insn.operands[1].mem.base != cs_x86.X86_REG_ESP
-                and insn.operands[1].mem.base != cs_x86.X86_REG_EBP
-            ):
-                cand = (analysis.got_va + insn.operands[1].mem.disp) & 0xFFFFFFFF
-                if cand in analysis.addr_taken_funcs:
-                    dst_idx = REG32_IDX[insn.operands[0].reg]
-                    patch_off = len(code_buf) + 2
-                    code_buf.extend(_emit_lea_rip_to_reg32(dst_idx, 0))
-                    label_fixups.append((patch_off, cur_new_va + 6, f"__nm_dual_{cand:08x}"))
-                    idx += 1
-                    continue
+                    # Check if this function entry is marked REQUIRES_DBT_FALLBACK
+                    if va in fallback_va_set:
+                        lbl = f"__nm_fb_{va:08x}"
+                        patch_off = len(code_buf) + 1
+                        code_buf.extend(b"\xe9\x00\x00\x00\x00")
+                        label_fixups.append((patch_off, cur_new_va + 5, lbl))
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
 
-            # 5. Unreachable `hlt` (e.g. crt1.o fallthrough after `call __libc_start_main`)
-            if insn.id == cs_x86.X86_INS_HLT:
-                if va in analysis.reachable_insns:
-                    raise PatcherError(f"reachable 'hlt' at 0x{va:08x}")
-                code_buf.append(0xCC)
-                idx += 1
-                continue
+                    # 1. Jump table replacement span
+                    if va in jt_by_start:
+                        jt = jt_by_start[va]
+                        idx_r = REG32_IDX.get(jt.idx_reg, 0)
+                        jt_blob = JumpTableBlob(rodata_offset=rodata_off, targets=list(jt.targets))
+                        jump_table_blobs.append(jt_blob)
+                        rodata_off += len(jt.targets) * 4
 
-            # 6. `endbr32` -> `endbr64`
-            if insn.id == cs_x86.X86_INS_ENDBR32:
-                code_buf.extend(b"\xf3\x0f\x1e\xfa")
-                idx += 1
-                continue
-
-            # 7. Multi-byte NOPs
-            if _is_gcc_multibyte_nop(insn):
-                code_buf.append(0x90)
-                idx += 1
-                continue
-
-            # 8. `int 0x80` / `sysenter`
-            if (insn.id == cs_x86.X86_INS_INT and len(insn.bytes) >= 2 and insn.bytes[1] == 0x80) or (
-                insn.id == cs_x86.X86_INS_SYSENTER
-            ):
-                code_buf.extend(_emit_dispatch_call(1, cur_new_va))
-                idx += 1
-                continue
-
-            # 9. `0x40..0x4F` single-byte `inc`/`dec r32`
-            if len(insn.bytes) == 1 and 0x40 <= insn.bytes[0] <= 0x4F:
-                b0 = insn.bytes[0]
-                if b0 <= 0x47:
-                    code_buf.extend(bytes([0xFF, 0xC0 + (b0 - 0x40)]))
-                else:
-                    code_buf.extend(bytes([0xFF, 0xC8 + (b0 - 0x48)]))
-                idx += 1
-                continue
-
-            # 10. `pusha` / `popa`
-            if insn.id == cs_x86.X86_INS_PUSHAL:
-                # movl %esp, %r11d; lea -32(%rsp), %rsp; save eax,ecx,edx,ebx,orig_esp,ebp,esi,edi
-                code_buf.extend(b"\x41\x89\xe3")              # movl %esp, %r11d
-                code_buf.extend(b"\x48\x8d\x64\x24\xe0")      # lea -32(%rsp), %rsp
-                # offsets: +28=eax, +24=ecx, +20=edx, +16=ebx, +12=r11d, +8=ebp, +4=esi, +0=edi
-                for reg_i, off_s in ((0, 28), (1, 24), (2, 20), (3, 16), (5, 8), (6, 4), (7, 0)):
-                    code_buf.extend(bytes([0x89, 0x44 | (reg_i << 3), 0x24, off_s]))
-                code_buf.extend(b"\x44\x89\x5c\x24\x0c")      # movl %r11d, 12(%rsp)
-                idx += 1
-                continue
-
-            if insn.id == cs_x86.X86_INS_POPAL:
-                for reg_i, off_s in ((7, 0), (6, 4), (5, 8), (3, 16), (2, 20), (1, 24), (0, 28)):
-                    code_buf.extend(bytes([0x8B, 0x44 | (reg_i << 3), 0x24, off_s]))
-                code_buf.extend(b"\x48\x8d\x64\x24\x20")      # lea 32(%rsp), %rsp
-                idx += 1
-                continue
-
-            # 11. `push` variants
-            if insn.id == cs_x86.X86_INS_PUSH and len(insn.operands) == 1:
-                op = insn.operands[0]
-                if op.type == cs_x86.X86_OP_REG and op.reg in REG32_IDX:
-                    code_buf.extend(_emit_push_reg32(REG32_IDX[op.reg]))
-                elif op.type == cs_x86.X86_OP_IMM:
-                    imm = op.imm & 0xFFFFFFFF
-                    if analysis.e_type == 2 and imm in analysis.addr_taken_funcs:
-                        # ET_EXEC push $func_va -> leal dual(%rip), %r11d; push %r11d
+                        # leal jt(%rip), %r11d (7B)
+                        # movl %idx32, %r10d    (3B: 41 89 <0xC2 | idx_r<<3>)
+                        # addl (%r11,%r10,4), %r11d (4B: 47 03 1c 93)
+                        # jmp *%r11             (3B: 41 ff e3)
                         patch_off = len(code_buf) + 3
                         code_buf.extend(_emit_lea_rip_to_r11d(0))
-                        label_fixups.append((patch_off, cur_new_va + 7, f"__nm_dual_{imm:08x}"))
-                        code_buf.extend(b"\x48\x8d\x64\x24\xfc\x44\x89\x1c\x24")
-                    else:
-                        if imm >= 0x80000000:
-                            imm -= 0x100000000
-                        code_buf.extend(_emit_push_imm32(imm))
-                elif op.type == cs_x86.X86_OP_MEM:
-                    code_buf.extend(_rewrite_rm32_mov_r11d(insn, store_to_mem=False))
-                    code_buf.extend(b"\x48\x8d\x64\x24\xfc\x44\x89\x1c\x24")
-                else:
-                    raise PatcherError(
-                        f"unsupported push operand at 0x{va:08x}: {insn.mnemonic} {insn.op_str}"
-                    )
-                idx += 1
-                continue
+                        rodata_fixups.append((patch_off, cur_new_va + 7, jt_blob.rodata_offset))
+                        code_buf.extend(bytes([0x41, 0x89, 0xC2 | (idx_r << 3)]))
+                        code_buf.extend(b"\x47\x03\x1c\x93")
+                        code_buf.extend(b"\x41\xff\xe3")
 
-            # 12. `pop` variants
-            if insn.id == cs_x86.X86_INS_POP and len(insn.operands) == 1:
-                op = insn.operands[0]
-                if op.type == cs_x86.X86_OP_REG and op.reg in REG32_IDX:
-                    code_buf.extend(_emit_pop_reg32(REG32_IDX[op.reg]))
-                elif op.type == cs_x86.X86_OP_MEM:
-                    code_buf.extend(b"\x44\x8b\x1c\x24\x48\x8d\x64\x24\x04")
-                    code_buf.extend(_rewrite_rm32_mov_r11d(insn, store_to_mem=True))
-                else:
-                    raise PatcherError(
-                        f"unsupported pop operand at 0x{va:08x}: {insn.mnemonic} {insn.op_str}"
-                    )
-                idx += 1
-                continue
+                        while idx < len(insns) and insns[idx].address < jt.replace_end_va:
+                            if insns[idx].address not in orig_to_new:
+                                orig_to_new[insns[idx].address] = cur_new_va
+                            got_tracker.on_instruction(insns[idx])
+                            idx += 1
+                        continue
 
-            # 13. `pushf` / `popf`
-            if insn.id in (cs_x86.X86_INS_PUSHF, cs_x86.X86_INS_PUSHFD):
-                code_buf.extend(b"\x9c\x41\x5b\x48\x8d\x64\x24\xfc\x44\x89\x1c\x24")
-                idx += 1
-                continue
-            if insn.id in (cs_x86.X86_INS_POPF, cs_x86.X86_INS_POPFD):
-                code_buf.extend(b"\x44\x8b\x1c\x24\x48\x8d\x64\x24\x04\x41\x53\x9d")
-                idx += 1
-                continue
+                    # 2. Inline `call $+5; pop %reg` PIC idiom
+                    if (
+                        insn.id == cs_x86.X86_INS_CALL
+                        and len(insn.operands) == 1
+                        and insn.operands[0].type == cs_x86.X86_OP_IMM
+                        and (insn.operands[0].imm & 0xFFFFFFFF) == va + insn.size
+                        and idx + 1 < len(insns)
+                        and insns[idx + 1].id == cs_x86.X86_INS_POP
+                        and len(insns[idx + 1].operands) == 1
+                        and insns[idx + 1].operands[0].type == cs_x86.X86_OP_REG
+                    ):
+                        pop_insn = insns[idx + 1]
+                        r_idx = REG32_IDX.get(pop_insn.operands[0].reg)
+                        if r_idx is not None:
+                            orig_pc = pop_insn.address
+                            # leal (orig_pc - (cur_new_va + 6))(%rip), %reg32
+                            disp = (orig_pc - (cur_new_va + 6)) & 0xFFFFFFFF
+                            if disp >= 0x80000000:
+                                disp -= 0x100000000
+                            code_buf.extend(_emit_lea_rip_to_reg32(r_idx, disp))
+                            orig_to_new[pop_insn.address] = cur_new_va
+                            got_tracker.on_instruction(insn, pop_insn)
+                            got_tracker.on_instruction(pop_insn)
+                            idx += 2
+                            continue
 
-            # 14. `leave` / `enter`
-            if insn.id == cs_x86.X86_INS_LEAVE:
-                code_buf.extend(b"\x89\xec\x8b\x2c\x24\x48\x8d\x64\x24\x04")
-                idx += 1
-                continue
-            if insn.id == cs_x86.X86_INS_ENTER and len(insn.operands) == 2:
-                frame_sz = int(insn.operands[0].imm) & 0xFFFF
-                code_buf.extend(_emit_push_reg32(5))  # push ebp
-                code_buf.extend(b"\x89\xe5")          # mov ebp, esp
-                if frame_sz:
-                    code_buf.extend(b"\x48\x8d\xa4\x24" + struct.pack("<i", -frame_sz))
-                idx += 1
-                continue
+                    # 3. `call __x86.get_pc_thunk.<reg>`
+                    if insn.id == cs_x86.X86_INS_CALL and len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
+                        tgt = insn.operands[0].imm & 0xFFFFFFFF
+                        if tgt in analysis.pic_thunks:
+                            r_idx = REG32_NAME_TO_IDX[analysis.pic_thunks[tgt]]
+                            orig_ret = va + insn.size
+                            disp = (orig_ret - (cur_new_va + 6)) & 0xFFFFFFFF
+                            if disp >= 0x80000000:
+                                disp -= 0x100000000
+                            code_buf.extend(_emit_lea_rip_to_reg32(r_idx, disp))
+                            got_tracker.on_instruction(insn, next_insn)
+                            idx += 1
+                            continue
 
-            # 15. `ret` / `ret imm16`
-            if insn.id == cs_x86.X86_INS_RET:
-                adj = 4
-                if len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
-                    adj += int(insn.operands[0].imm) & 0xFFFF
-                code_buf.extend(b"\x44\x8b\x1c\x24")  # movl (%rsp), %r11d
-                if adj <= 127:
-                    code_buf.extend(bytes([0x48, 0x8D, 0x64, 0x24, adj]))
-                else:
-                    code_buf.extend(b"\x48\x8d\xa4\x24" + struct.pack("<i", adj))
-                code_buf.extend(b"\x41\xff\xe3")      # jmp *%r11
-                idx += 1
-                continue
+                    # 4. GOTOFF function pointer: `lea disp(%got_reg), %dst_reg`
+                    if (
+                        insn.id == cs_x86.X86_INS_LEA
+                        and len(insn.operands) == 2
+                        and insn.operands[0].type == cs_x86.X86_OP_REG
+                        and insn.operands[1].type == cs_x86.X86_OP_MEM
+                        and insn.operands[1].mem.index == cs_x86.X86_REG_INVALID
+                        and got_tracker.is_got_reg(insn.operands[1].mem.base)
+                    ):
+                        cand = (analysis.got_va + insn.operands[1].mem.disp) & 0xFFFFFFFF
+                        if cand in analysis.addr_taken_funcs:
+                            dst_idx = REG32_IDX[insn.operands[0].reg]
+                            patch_off = len(code_buf) + 2
+                            code_buf.extend(_emit_lea_rip_to_reg32(dst_idx, 0))
+                            label_fixups.append((patch_off, cur_new_va + 6, f"__nm_dual_{cand:08x}"))
+                            got_tracker.on_instruction(insn, next_insn)
+                            idx += 1
+                            continue
 
-            # 16. `call`
-            if insn.id == cs_x86.X86_INS_CALL and len(insn.operands) == 1:
-                op = insn.operands[0]
-                if op.type == cs_x86.X86_OP_IMM:
-                    tgt = op.imm & 0xFFFFFFFF
-                    if tgt in analysis.plt_stubs:
-                        slot_idx = seen_plt_syms[analysis.plt_stubs[tgt].sym_name]
-                        code_buf.extend(_emit_dispatch_call(slot_idx, cur_new_va))
-                    else:
-                        # Direct internal call:
-                        # leal .Lret(%rip), %r11d (7B); lea -4(%rsp), %rsp (5B); movl %r11d, (%rsp) (4B); jmp tgt (5B)
-                        code_buf.extend(_emit_lea_rip_to_r11d(14))
-                        code_buf.extend(b"\x48\x8d\x64\x24\xfc\x44\x89\x1c\x24")
-                        jmp_off = len(code_buf) + 1
-                        code_buf.extend(b"\xe9\x00\x00\x00\x00")
+                    # 5. Unreachable `hlt` (e.g. crt1.o fallthrough after `call __libc_start_main`)
+                    if insn.id == cs_x86.X86_INS_HLT:
+                        if va in analysis.reachable_insns:
+                            raise PatcherError(f"reachable 'hlt' at 0x{va:08x}")
+                        code_buf.append(0xCC)
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 6. `endbr32` -> `endbr64`
+                    if insn.id == cs_x86.X86_INS_ENDBR32:
+                        code_buf.extend(b"\xf3\x0f\x1e\xfa")
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 7. Multi-byte NOPs
+                    if _is_gcc_multibyte_nop(insn):
+                        code_buf.append(0x90)
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 8. `int 0x80` / `sysenter`
+                    if (insn.id == cs_x86.X86_INS_INT and len(insn.bytes) >= 2 and insn.bytes[1] == 0x80) or (
+                        insn.id == cs_x86.X86_INS_SYSENTER
+                    ):
+                        code_buf.extend(_emit_dispatch_call(1, cur_new_va))
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 9. `0x40..0x4F` `inc`/`dec r32` or prefixed (e.g. 0x66) `inc`/`dec r16`
+                    if (
+                        (len(insn.bytes) == 1 and 0x40 <= insn.bytes[0] <= 0x4F)
+                        or (
+                            insn.id in (cs_x86.X86_INS_INC, cs_x86.X86_INS_DEC)
+                            and len(insn.bytes) >= 1
+                            and 0x40 <= insn.bytes[-1] <= 0x4F
+                        )
+                    ):
+                        b_op = insn.bytes[-1]
+                        modrm = (0xC0 + (b_op - 0x40)) if b_op <= 0x47 else (0xC8 + (b_op - 0x48))
+                        prefixes = bytes(insn.bytes[:-1])
+                        code_buf.extend(prefixes + bytes([0xFF, modrm]))
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 10. `pusha` / `popa`
+                    if insn.id == cs_x86.X86_INS_PUSHAL:
+                        # movl %esp, %r11d; lea -32(%rsp), %rsp; save eax,ecx,edx,ebx,orig_esp,ebp,esi,edi
+                        code_buf.extend(b"\x41\x89\xe3")              # movl %esp, %r11d
+                        code_buf.extend(b"\x48\x8d\x64\x24\xe0")      # lea -32(%rsp), %rsp
+                        # offsets: +28=eax, +24=ecx, +20=edx, +16=ebx, +12=r11d, +8=ebp, +4=esi, +0=edi
+                        for reg_i, off_s in ((0, 28), (1, 24), (2, 20), (3, 16), (5, 8), (6, 4), (7, 0)):
+                            code_buf.extend(bytes([0x89, 0x44 | (reg_i << 3), 0x24, off_s]))
+                        code_buf.extend(b"\x44\x89\x5c\x24\x0c")      # movl %r11d, 12(%rsp)
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    if insn.id == cs_x86.X86_INS_POPAL:
+                        for reg_i, off_s in ((7, 0), (6, 4), (5, 8), (3, 16), (2, 20), (1, 24), (0, 28)):
+                            code_buf.extend(bytes([0x8B, 0x44 | (reg_i << 3), 0x24, off_s]))
+                        code_buf.extend(b"\x48\x8d\x64\x24\x20")      # lea 32(%rsp), %rsp
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 11. `push` variants
+                    if insn.id == cs_x86.X86_INS_PUSH and len(insn.operands) == 1:
+                        op = insn.operands[0]
+                        if op.type == cs_x86.X86_OP_REG and op.reg in REG32_IDX:
+                            code_buf.extend(_emit_push_reg32(REG32_IDX[op.reg]))
+                        elif op.type == cs_x86.X86_OP_IMM:
+                            imm = op.imm & 0xFFFFFFFF
+                            if analysis.e_type == 2 and imm in analysis.addr_taken_funcs:
+                                # ET_EXEC push $func_va -> leal dual(%rip), %r11d; push %r11d
+                                patch_off = len(code_buf) + 3
+                                code_buf.extend(_emit_lea_rip_to_r11d(0))
+                                label_fixups.append((patch_off, cur_new_va + 7, f"__nm_dual_{imm:08x}"))
+                                code_buf.extend(b"\x48\x8d\x64\x24\xfc\x44\x89\x1c\x24")
+                            else:
+                                if imm >= 0x80000000:
+                                    imm -= 0x100000000
+                                code_buf.extend(_emit_push_imm32(imm))
+                        elif op.type == cs_x86.X86_OP_MEM:
+                            code_buf.extend(_rewrite_rm32_mov_r11d(insn, store_to_mem=False))
+                            code_buf.extend(b"\x48\x8d\x64\x24\xfc\x44\x89\x1c\x24")
+                        else:
+                            raise PatcherError(
+                                f"unsupported push operand at 0x{va:08x}: {insn.mnemonic} {insn.op_str}"
+                            )
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 12. `pop` variants
+                    if insn.id == cs_x86.X86_INS_POP and len(insn.operands) == 1:
+                        op = insn.operands[0]
+                        if op.type == cs_x86.X86_OP_REG and op.reg in REG32_IDX:
+                            code_buf.extend(_emit_pop_reg32(REG32_IDX[op.reg]))
+                        elif op.type == cs_x86.X86_OP_MEM:
+                            code_buf.extend(b"\x44\x8b\x1c\x24\x48\x8d\x64\x24\x04")
+                            code_buf.extend(_rewrite_rm32_mov_r11d(insn, store_to_mem=True))
+                        else:
+                            raise PatcherError(
+                                f"unsupported pop operand at 0x{va:08x}: {insn.mnemonic} {insn.op_str}"
+                            )
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 13. `pushf` / `popf`
+                    if insn.id in (cs_x86.X86_INS_PUSHF, cs_x86.X86_INS_PUSHFD):
+                        code_buf.extend(b"\x9c\x41\x5b\x48\x8d\x64\x24\xfc\x44\x89\x1c\x24")
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+                    if insn.id in (cs_x86.X86_INS_POPF, cs_x86.X86_INS_POPFD):
+                        code_buf.extend(b"\x44\x8b\x1c\x24\x48\x8d\x64\x24\x04\x41\x53\x9d")
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 14. `leave` / `enter`
+                    if insn.id == cs_x86.X86_INS_LEAVE:
+                        code_buf.extend(b"\x89\xec\x8b\x2c\x24\x48\x8d\x64\x24\x04")
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+                    if insn.id == cs_x86.X86_INS_ENTER and len(insn.operands) == 2:
+                        frame_sz = int(insn.operands[0].imm) & 0xFFFF
+                        code_buf.extend(_emit_push_reg32(5))  # push ebp
+                        code_buf.extend(b"\x89\xe5")          # mov ebp, esp
+                        if frame_sz:
+                            code_buf.extend(b"\x48\x8d\xa4\x24" + struct.pack("<i", -frame_sz))
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 15. `ret` / `ret imm16`
+                    if insn.id == cs_x86.X86_INS_RET:
+                        adj = 4
+                        if len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
+                            adj += int(insn.operands[0].imm) & 0xFFFF
+                        code_buf.extend(b"\x44\x8b\x1c\x24")  # movl (%rsp), %r11d
+                        if adj <= 127:
+                            code_buf.extend(bytes([0x48, 0x8D, 0x64, 0x24, adj]))
+                        else:
+                            code_buf.extend(b"\x48\x8d\xa4\x24" + struct.pack("<i", adj))
+                        code_buf.extend(b"\x41\xff\xe3")      # jmp *%r11
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 16. `call`
+                    if insn.id == cs_x86.X86_INS_CALL and len(insn.operands) == 1:
+                        op = insn.operands[0]
+                        if op.type == cs_x86.X86_OP_IMM:
+                            tgt = op.imm & 0xFFFFFFFF
+                            if tgt in analysis.plt_stubs:
+                                slot_idx = seen_plt_syms[analysis.plt_stubs[tgt].sym_name]
+                                code_buf.extend(_emit_dispatch_call(slot_idx, cur_new_va))
+                            else:
+                                # Direct internal call:
+                                # leal .Lret(%rip), %r11d (7B); lea -4(%rsp), %rsp (5B); movl %r11d, (%rsp) (4B); jmp tgt (5B)
+                                code_buf.extend(_emit_lea_rip_to_r11d(14))
+                                code_buf.extend(b"\x48\x8d\x64\x24\xfc\x44\x89\x1c\x24")
+                                jmp_off = len(code_buf) + 1
+                                code_buf.extend(b"\xe9\x00\x00\x00\x00")
+                                branch_fixups.append(
+                                    BranchFixup(
+                                        patch_off=jmp_off,
+                                        next_insn_va=cur_new_va + 21,
+                                        target_orig_va=tgt,
+                                        target_kind="orig",
+                                    )
+                                )
+                        else:
+                            # Indirect call `call *r/m32`
+                            # movl r/m32, %r11d; leal .Lret(%rip), %r10d; lea -4(%rsp), %rsp; movl %r10d, (%rsp); jmp __nm_icall
+                            code_buf.extend(_rewrite_rm32_mov_r11d(insn, store_to_mem=False))
+                            sub_start = len(code_buf)
+                            # Remaining: 7 + 5 + 4 + 5 = 21 bytes; disp for leal is 21 - 7 = 14
+                            code_buf.extend(_emit_lea_rip_to_r10d(14))
+                            code_buf.extend(b"\x48\x8d\x64\x24\xfc\x44\x89\x14\x24")
+                            jmp_off = len(code_buf) + 1
+                            code_buf.extend(b"\xe9\x00\x00\x00\x00")
+                            branch_fixups.append(
+                                BranchFixup(
+                                    patch_off=jmp_off,
+                                    next_insn_va=base_va + sub_start + 21,
+                                    target_orig_va=0,
+                                    target_kind="dispatch",
+                                )
+                            )
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 17. `jmp`
+                    if insn.id == cs_x86.X86_INS_JMP and len(insn.operands) == 1:
+                        op = insn.operands[0]
+                        if op.type == cs_x86.X86_OP_IMM:
+                            tgt = op.imm & 0xFFFFFFFF
+                            if tgt in analysis.plt_stubs:
+                                slot_idx = seen_plt_syms[analysis.plt_stubs[tgt].sym_name]
+                                code_buf.extend(_emit_dispatch_jmp(slot_idx, cur_new_va))
+                            else:
+                                jmp_off = len(code_buf) + 1
+                                code_buf.extend(b"\xe9\x00\x00\x00\x00")
+                                branch_fixups.append(
+                                    BranchFixup(
+                                        patch_off=jmp_off,
+                                        next_insn_va=cur_new_va + 5,
+                                        target_orig_va=tgt,
+                                        target_kind="orig",
+                                    )
+                                )
+                        else:
+                            # Tail indirect jump `jmp *r/m32` (not a jump table)
+                            if insn.address in analysis.plt_stubs:
+                                slot_idx = seen_plt_syms[analysis.plt_stubs[insn.address].sym_name]
+                                code_buf.extend(_emit_dispatch_jmp(slot_idx, cur_new_va))
+                            else:
+                                code_buf.extend(_rewrite_rm32_mov_r11d(insn, store_to_mem=False))
+                                code_buf.extend(_emit_dispatch_jmp(2, base_va + len(code_buf)))
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 18. Conditional branches `jcc`
+                    if insn.id in JCC_SHORT_MAP and len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
+                        cc = JCC_SHORT_MAP[insn.id]
+                        tgt = insn.operands[0].imm & 0xFFFFFFFF
+                        patch_off = len(code_buf) + 2
+                        code_buf.extend(bytes([0x0F, 0x80 + cc, 0, 0, 0, 0]))
                         branch_fixups.append(
                             BranchFixup(
-                                patch_off=jmp_off,
-                                next_insn_va=cur_new_va + 21,
+                                patch_off=patch_off,
+                                next_insn_va=cur_new_va + 6,
                                 target_orig_va=tgt,
                                 target_kind="orig",
                             )
                         )
-                else:
-                    # Indirect call `call *r/m32`
-                    # movl r/m32, %r11d; leal .Lret(%rip), %r10d; lea -4(%rsp), %rsp; movl %r10d, (%rsp); jmp __nm_icall
-                    code_buf.extend(_rewrite_rm32_mov_r11d(insn, store_to_mem=False))
-                    sub_start = len(code_buf)
-                    # Remaining: 7 + 5 + 4 + 5 = 21 bytes; disp for leal is 21 - 7 = 14
-                    code_buf.extend(_emit_lea_rip_to_r10d(14))
-                    code_buf.extend(b"\x48\x8d\x64\x24\xfc\x44\x89\x14\x24")
-                    jmp_off = len(code_buf) + 1
-                    code_buf.extend(b"\xe9\x00\x00\x00\x00")
-                    branch_fixups.append(
-                        BranchFixup(
-                            patch_off=jmp_off,
-                            next_insn_va=base_va + sub_start + 21,
-                            target_orig_va=0,
-                            target_kind="dispatch",
-                        )
-                    )
-                idx += 1
-                continue
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
 
-            # 17. `jmp`
-            if insn.id == cs_x86.X86_INS_JMP and len(insn.operands) == 1:
-                op = insn.operands[0]
-                if op.type == cs_x86.X86_OP_IMM:
-                    tgt = op.imm & 0xFFFFFFFF
-                    if tgt in analysis.plt_stubs:
-                        slot_idx = seen_plt_syms[analysis.plt_stubs[tgt].sym_name]
-                        code_buf.extend(_emit_dispatch_jmp(slot_idx, cur_new_va))
-                    else:
-                        jmp_off = len(code_buf) + 1
-                        code_buf.extend(b"\xe9\x00\x00\x00\x00")
+                    if insn.id in (cs_x86.X86_INS_JCXZ, cs_x86.X86_INS_JECXZ):
+                        tgt = insn.operands[0].imm & 0xFFFFFFFF
+                        # Zero EFLAGS modified:
+                        # For jecxz (32-bit count %ecx): 67 e3 02 eb 05 e9 <rel32> (10 bytes)
+                        #   67 e3 02: jecxz +2 -> jump over 'eb 05' (2 bytes) directly to 'e9 <rel32>'
+                        #   eb 05:    jmp +5   -> jump over the 5-byte 'e9 <rel32>' to next instruction
+                        #   e9 rel32: jmp rel32 -> jump to target VA
+                        # For jcxz (16-bit count %cx): 66 67 e3 02 eb 05 e9 <rel32> (11 bytes)
+                        if insn.id == cs_x86.X86_INS_JECXZ:
+                            code_buf.extend(b"\x67\xe3\x02\xeb\x05\xe9\x00\x00\x00\x00")
+                            next_va = cur_new_va + 10
+                        else:
+                            code_buf.extend(b"\x66\x67\xe3\x02\xeb\x05\xe9\x00\x00\x00\x00")
+                            next_va = cur_new_va + 11
                         branch_fixups.append(
                             BranchFixup(
-                                patch_off=jmp_off,
-                                next_insn_va=cur_new_va + 5,
+                                patch_off=len(code_buf) - 4,
+                                next_insn_va=next_va,
                                 target_orig_va=tgt,
                                 target_kind="orig",
                             )
                         )
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    if insn.id == cs_x86.X86_INS_LOOP:
+                        tgt = insn.operands[0].imm & 0xFFFFFFFF
+                        # leal -1(%ecx), %ecx (3B: 67 8d 49 ff); jecxz +5 (2B: 67 e3 05); jmp rel32 (5B)
+                        code_buf.extend(b"\x67\x8d\x49\xff\x67\xe3\x05\xe9\x00\x00\x00\x00")
+                        branch_fixups.append(
+                            BranchFixup(
+                                patch_off=len(code_buf) - 4,
+                                next_insn_va=cur_new_va + 12,
+                                target_orig_va=tgt,
+                                target_kind="orig",
+                            )
+                        )
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 19. ET_EXEC `mov $func_va, %reg32` (B8+r imm32)
+                    if (
+                        analysis.e_type == 2
+                        and insn.id == cs_x86.X86_INS_MOV
+                        and len(insn.operands) == 2
+                        and insn.operands[0].type == cs_x86.X86_OP_REG
+                        and insn.operands[0].reg in REG32_IDX
+                        and insn.operands[1].type == cs_x86.X86_OP_IMM
+                        and (insn.operands[1].imm & 0xFFFFFFFF) in analysis.addr_taken_funcs
+                    ):
+                        dst_idx = REG32_IDX[insn.operands[0].reg]
+                        fva = insn.operands[1].imm & 0xFFFFFFFF
+                        patch_off = len(code_buf) + 2
+                        code_buf.extend(_emit_lea_rip_to_reg32(dst_idx, 0))
+                        label_fixups.append((patch_off, cur_new_va + 6, f"__nm_dual_{fva:08x}"))
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 19b. ET_EXEC `movl $func_va, mem` (C7 /0 imm32)
+                    if (
+                        analysis.e_type == 2
+                        and insn.id == cs_x86.X86_INS_MOV
+                        and len(insn.operands) == 2
+                        and insn.operands[0].type == cs_x86.X86_OP_MEM
+                        and insn.operands[1].type == cs_x86.X86_OP_IMM
+                        and (insn.operands[1].imm & 0xFFFFFFFF) in analysis.addr_taken_funcs
+                    ):
+                        fva = insn.operands[1].imm & 0xFFFFFFFF
+                        patch_off = len(code_buf) + 3
+                        code_buf.extend(_emit_lea_rip_to_r11d(0))
+                        label_fixups.append((patch_off, cur_new_va + 7, f"__nm_dual_{fva:08x}"))
+                        code_buf.extend(_rewrite_rm32_mov_r11d(insn, store_to_mem=True, has_imm32=True))
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 20. Segment-prefixed `%gs:` instructions
+                    if insn.prefix[1] == 0x65:
+                        code_buf.extend(_rewrite_gs_insn(insn))
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 21. `0xA0..0xA3` moffs32 without %gs:
+                    raw = bytes(insn.bytes)
+                    op_scan = 0
+                    while op_scan < len(raw) and raw[op_scan] in (0x66, 0x67, 0xF0, 0xF2, 0xF3):
+                        op_scan += 1
+                    if op_scan < len(raw) and raw[op_scan] in (0xA0, 0xA1, 0xA2, 0xA3):
+                        code_buf.extend(_rewrite_moffs(insn))
+                        got_tracker.on_instruction(insn, next_insn)
+                        new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                        if new_off is not None:
+                            cr_off = new_off
+                            broke_for_data = True
+                            break
+                        idx += 1
+                        continue
+
+                    # 22. General instructions: check if memory operand or string instruction needs 0x67 / SIB 0x25
+                    has_mem = any(op.type == cs_x86.X86_OP_MEM for op in insn.operands)
+                    is_string_op = insn.id in (
+                        cs_x86.X86_INS_MOVSB, cs_x86.X86_INS_MOVSW, cs_x86.X86_INS_MOVSD,
+                        cs_x86.X86_INS_STOSB, cs_x86.X86_INS_STOSW, cs_x86.X86_INS_STOSD,
+                        cs_x86.X86_INS_LODSB, cs_x86.X86_INS_LODSW, cs_x86.X86_INS_LODSD,
+                        cs_x86.X86_INS_CMPSB, cs_x86.X86_INS_CMPSW, cs_x86.X86_INS_CMPSD,
+                        cs_x86.X86_INS_SCASB, cs_x86.X86_INS_SCASW, cs_x86.X86_INS_SCASD,
+                    )
+                    modrm_off = insn.encoding.modrm_offset
+                    code_buf.extend(
+                        _fix_modrm_disp32_and_addr32(
+                            raw,
+                            modrm_off,
+                            is_gs=False,
+                            add_addr32=(has_mem or is_string_op),
+                        )
+                    )
+                    got_tracker.on_instruction(insn, next_insn)
+                    new_off = _check_and_emit_inline_data_after_uncond(insn, cr)
+                    if new_off is not None:
+                        cr_off = new_off
+                        broke_for_data = True
+                        break
+                    idx += 1
+
+                if not broke_for_data:
+                    last_insn = insns[-1]
+                    cr_off = max(cr_off + 1, last_insn.address + last_insn.size - cr.va)
+            else:
+                # md.disasm could not decode at cr_off; advance past undecodable bytes
+                curr_va = cr.va + cr_off
+                ahead = [v for v in sorted(discovered_targets) if curr_va < v < cr.va + cr_len]
+                if ahead:
+                    target_off = ahead[0] - cr.va
+                    while cr_off < target_off:
+                        byte_va = cr.va + cr_off
+                        cur_new_va = base_va + len(code_buf)
+                        orig_to_new[byte_va] = cur_new_va
+                        code_buf.append(cr.data[cr_off])
+                        cr_off += 1
                 else:
-                    # Tail indirect jump `jmp *r/m32` (not a jump table)
-                    if insn.address in analysis.plt_stubs:
-                        slot_idx = seen_plt_syms[analysis.plt_stubs[insn.address].sym_name]
-                        code_buf.extend(_emit_dispatch_jmp(slot_idx, cur_new_va))
-                    else:
-                        code_buf.extend(_rewrite_rm32_mov_r11d(insn, store_to_mem=False))
-                        code_buf.extend(_emit_dispatch_jmp(2, base_va + len(code_buf)))
-                idx += 1
-                continue
-
-            # 18. Conditional branches `jcc`
-            if insn.id in JCC_SHORT_MAP and len(insn.operands) == 1 and insn.operands[0].type == cs_x86.X86_OP_IMM:
-                cc = JCC_SHORT_MAP[insn.id]
-                tgt = insn.operands[0].imm & 0xFFFFFFFF
-                patch_off = len(code_buf) + 2
-                code_buf.extend(bytes([0x0F, 0x80 + cc, 0, 0, 0, 0]))
-                branch_fixups.append(
-                    BranchFixup(
-                        patch_off=patch_off,
-                        next_insn_va=cur_new_va + 6,
-                        target_orig_va=tgt,
-                        target_kind="orig",
-                    )
-                )
-                idx += 1
-                continue
-
-            if insn.id in (cs_x86.X86_INS_JCXZ, cs_x86.X86_INS_JECXZ):
-                tgt = insn.operands[0].imm & 0xFFFFFFFF
-                # testl %ecx, %ecx; jz rel32 (2 + 6 = 8 bytes)
-                code_buf.extend(b"\x85\xc9\x0f\x84\x00\x00\x00\x00")
-                branch_fixups.append(
-                    BranchFixup(
-                        patch_off=len(code_buf) - 4,
-                        next_insn_va=cur_new_va + 8,
-                        target_orig_va=tgt,
-                        target_kind="orig",
-                    )
-                )
-                idx += 1
-                continue
-
-            if insn.id == cs_x86.X86_INS_LOOP:
-                tgt = insn.operands[0].imm & 0xFFFFFFFF
-                # leal -1(%ecx), %ecx (3B: 67 8d 49 ff); jecxz +5 (2B: 67 e3 05); jmp rel32 (5B)
-                code_buf.extend(b"\x67\x8d\x49\xff\x67\xe3\x05\xe9\x00\x00\x00\x00")
-                branch_fixups.append(
-                    BranchFixup(
-                        patch_off=len(code_buf) - 4,
-                        next_insn_va=cur_new_va + 12,
-                        target_orig_va=tgt,
-                        target_kind="orig",
-                    )
-                )
-                idx += 1
-                continue
-
-            # 19. ET_EXEC `mov $func_va, %reg32` (B8+r imm32)
-            if (
-                analysis.e_type == 2
-                and insn.id == cs_x86.X86_INS_MOV
-                and len(insn.operands) == 2
-                and insn.operands[0].type == cs_x86.X86_OP_REG
-                and insn.operands[0].reg in REG32_IDX
-                and insn.operands[1].type == cs_x86.X86_OP_IMM
-                and (insn.operands[1].imm & 0xFFFFFFFF) in analysis.addr_taken_funcs
-            ):
-                dst_idx = REG32_IDX[insn.operands[0].reg]
-                fva = insn.operands[1].imm & 0xFFFFFFFF
-                patch_off = len(code_buf) + 2
-                code_buf.extend(_emit_lea_rip_to_reg32(dst_idx, 0))
-                label_fixups.append((patch_off, cur_new_va + 6, f"__nm_dual_{fva:08x}"))
-                idx += 1
-                continue
-
-            # 20. Segment-prefixed `%gs:` instructions
-            if insn.prefix[1] == 0x65:
-                code_buf.extend(_rewrite_gs_insn(insn))
-                idx += 1
-                continue
-
-            # 21. `0xA0..0xA3` moffs32 without %gs:
-            raw = bytes(insn.bytes)
-            op_scan = 0
-            while op_scan < len(raw) and raw[op_scan] in (0x66, 0x67, 0xF0, 0xF2, 0xF3):
-                op_scan += 1
-            if op_scan < len(raw) and raw[op_scan] in (0xA0, 0xA1, 0xA2, 0xA3):
-                code_buf.extend(_rewrite_moffs(insn))
-                idx += 1
-                continue
-
-            # 22. General instructions: check if memory operand or string instruction needs 0x67 / SIB 0x25
-            has_mem = any(op.type == cs_x86.X86_OP_MEM for op in insn.operands)
-            is_string_op = insn.id in (
-                cs_x86.X86_INS_MOVSB, cs_x86.X86_INS_MOVSW, cs_x86.X86_INS_MOVSD,
-                cs_x86.X86_INS_STOSB, cs_x86.X86_INS_STOSW, cs_x86.X86_INS_STOSD,
-                cs_x86.X86_INS_LODSB, cs_x86.X86_INS_LODSW, cs_x86.X86_INS_LODSD,
-                cs_x86.X86_INS_CMPSB, cs_x86.X86_INS_CMPSW, cs_x86.X86_INS_CMPSD,
-                cs_x86.X86_INS_SCASB, cs_x86.X86_INS_SCASW, cs_x86.X86_INS_SCASD,
-            )
-            modrm_off = insn.encoding.modrm_offset
-            code_buf.extend(
-                _fix_modrm_disp32_and_addr32(
-                    raw,
-                    modrm_off,
-                    is_gs=False,
-                    add_addr32=(has_mem or is_string_op),
-                )
-            )
-            idx += 1
+                    while cr_off < cr_len:
+                        curr_va = cr.va + cr_off
+                        test_insn = next(md.disasm(cr.data[cr_off:], curr_va, count=1), None)
+                        if test_insn is not None:
+                            break
+                        cur_new_va = base_va + len(code_buf)
+                        orig_to_new[curr_va] = cur_new_va
+                        code_buf.append(cr.data[cr_off])
+                        cr_off += 1
 
     # Pass 2: resolve internal branches & dispatch vector jumps
     for bf in branch_fixups:

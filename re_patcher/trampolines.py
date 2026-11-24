@@ -1,4 +1,4 @@
-"""Stage 2a — Long Mode x32 Trampolines, Compat Signatures, & Assembler/Linker Driver."""
+"""Stage 2a — Long Mode x32 Trampolines, Lookup-Driven ABI Signatures, & Assembler/Linker Driver."""
 
 from __future__ import annotations
 
@@ -7,267 +7,176 @@ import shutil
 import struct
 import subprocess
 import tempfile
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from elftools.elf.elffile import ELFFile
 
 from . import PatcherError
-
-# Match src/common/newminhh_abi.h
-NM_RET_VOID = 0
-NM_RET_I32 = 1
-NM_RET_U32 = 2
-NM_RET_PTR = 3
-NM_RET_I64 = 4
-NM_RET_U64 = 5
-NM_RET_F32 = 6
-NM_RET_F64 = 7
-
-NM_ARG_NONE = 0
-NM_ARG_I32 = 1
-NM_ARG_U32 = 2
-NM_ARG_PTR = 3
-NM_ARG_I64 = 4
-NM_ARG_U64 = 5
-NM_ARG_F32 = 6
-NM_ARG_F64 = 7
-
-# Symbol name -> (ret_kind, [arg_kinds], is_variadic, is_cdecl_direct)
-COMPAT_SIGNATURES: Dict[str, Tuple[int, List[int], int, bool]] = {
-    # Alloc / mem
-    "malloc": (NM_RET_PTR, [NM_ARG_U32], 0, False),
-    "calloc": (NM_RET_PTR, [NM_ARG_U32, NM_ARG_U32], 0, False),
-    "realloc": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "aligned_alloc": (NM_RET_PTR, [NM_ARG_U32, NM_ARG_U32], 0, False),
-    "free": (NM_RET_VOID, [NM_ARG_PTR], 0, False),
-    "free_sized": (NM_RET_VOID, [NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "free_aligned_sized": (NM_RET_VOID, [NM_ARG_PTR, NM_ARG_U32, NM_ARG_U32], 0, False),
-    "memset": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_I32, NM_ARG_U32], 0, False),
-    "memset_explicit": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_I32, NM_ARG_U32], 0, False),
-    "memcpy": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "memmove": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "memcmp": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "memchr": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_I32, NM_ARG_U32], 0, False),
-    "memccpy": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32, NM_ARG_U32], 0, False),
-    # Strings & numeric
-    "strlen": (NM_RET_U32, [NM_ARG_PTR], 0, False),
-    "strcmp": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "strncmp": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "strcpy": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "strncpy": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "strcat": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "strchr": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "strrchr": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "strstr": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "strdup": (NM_RET_PTR, [NM_ARG_PTR], 0, False),
-    "strndup": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "strtol": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "strtoul": (NM_RET_U32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "strtoll": (NM_RET_I64, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "strtoull": (NM_RET_U64, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "__isoc23_strtol": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "__isoc23_strtoul": (NM_RET_U32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "__isoc23_strtoll": (NM_RET_I64, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "__isoc23_strtoull": (NM_RET_U64, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "atoi": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "atol": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "getenv": (NM_RET_PTR, [NM_ARG_PTR], 0, False),
-    "setenv": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "unsetenv": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    # Stdio
-    "printf": (NM_RET_I32, [NM_ARG_PTR], 1, True),
-    "fprintf": (NM_RET_I32, [NM_ARG_PTR], 1, True),
-    "sprintf": (NM_RET_I32, [NM_ARG_PTR], 1, True),
-    "snprintf": (NM_RET_I32, [NM_ARG_PTR], 1, True),
-    "vprintf": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "vfprintf": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "vsprintf": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "vsnprintf": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_U32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "puts": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "fputs": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "putchar": (NM_RET_I32, [NM_ARG_I32], 0, False),
-    "fputc": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "fwrite": (NM_RET_U32, [NM_ARG_PTR, NM_ARG_U32, NM_ARG_U32, NM_ARG_PTR], 0, False),
-    "fread": (NM_RET_U32, [NM_ARG_PTR, NM_ARG_U32, NM_ARG_U32, NM_ARG_PTR], 0, False),
-    "fopen": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "fopen64": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "fclose": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "fflush": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "fseek": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_I32, NM_ARG_I32], 0, False),
-    "ftell": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "fgets": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "perror": (NM_RET_VOID, [NM_ARG_PTR], 0, False),
-    "setvbuf": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32, NM_ARG_U32], 0, False),
-    # File / POSIX
-    "open": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_I32, NM_ARG_U32], 1, False),
-    "open64": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_I32, NM_ARG_U32], 1, False),
-    "openat": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_I32, NM_ARG_U32], 1, False),
-    "close": (NM_RET_I32, [NM_ARG_I32], 0, False),
-    "read": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "write": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "lseek": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_I32], 0, False),
-    "lseek64": (NM_RET_I64, [NM_ARG_I32, NM_ARG_I64, NM_ARG_I32], 0, False),
-    "unlink": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "symlink": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "readlink": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "access": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "fcntl": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_U32], 1, False),
-    "ioctl": (NM_RET_I32, [NM_ARG_I32, NM_ARG_U32, NM_ARG_U32], 1, False),
-    "dup": (NM_RET_I32, [NM_ARG_I32], 0, False),
-    "dup2": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32], 0, False),
-    "dup3": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_I32], 0, False),
-    "pipe": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "pipe2": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "isatty": (NM_RET_I32, [NM_ARG_I32], 0, False),
-    "getpid": (NM_RET_I32, [], 0, False),
-    "gettid": (NM_RET_I32, [], 0, False),
-    "getuid": (NM_RET_U32, [], 0, False),
-    "geteuid": (NM_RET_U32, [], 0, False),
-    "getgid": (NM_RET_U32, [], 0, False),
-    "getegid": (NM_RET_U32, [], 0, False),
-    "sleep": (NM_RET_U32, [NM_ARG_U32], 0, False),
-    "usleep": (NM_RET_I32, [NM_ARG_U32], 0, False),
-    "mmap": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_U32, NM_ARG_I32, NM_ARG_I32, NM_ARG_I32, NM_ARG_I32], 0, False),
-    "mmap64": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_U32, NM_ARG_I32, NM_ARG_I32, NM_ARG_I32, NM_ARG_I64], 0, False),
-    "munmap": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_U32], 0, False),
-    "mprotect": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_U32, NM_ARG_I32], 0, False),
-    "uname": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "sysconf": (NM_RET_I32, [NM_ARG_I32], 0, False),
-    # Struct repacking
-    "stat": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "lstat": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "fstat": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "fstatat": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "stat64": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "lstat64": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "fstat64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "fstatat64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "__xstat": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "__lxstat": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "__fxstat": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "__fxstatat": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "__xstat64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "__lxstat64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "__fxstat64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "__fxstatat64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "__stat64_time64": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "__lstat64_time64": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "__fstat64_time64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "__fstatat64_time64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "clock_gettime": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "__clock_gettime64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "nanosleep": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "__nanosleep64": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "clock_nanosleep": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "__clock_nanosleep64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "gettimeofday": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "time": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "timespec_get": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "getrlimit": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "setrlimit": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "getrlimit64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "setrlimit64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR], 0, False),
-    "prlimit": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "prlimit64": (NM_RET_I32, [NM_ARG_I32, NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    # Callbacks / pthreads / lifecycle
-    "qsort": (NM_RET_VOID, [NM_ARG_PTR, NM_ARG_U32, NM_ARG_U32, NM_ARG_U32], 0, False),
-    "bsearch": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_U32, NM_ARG_U32, NM_ARG_U32], 0, False),
-    "pthread_create": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_U32, NM_ARG_U32], 0, False),
-    "pthread_join": (NM_RET_I32, [NM_ARG_U32, NM_ARG_PTR], 0, False),
-    "pthread_detach": (NM_RET_I32, [NM_ARG_U32], 0, False),
-    "pthread_self": (NM_RET_U32, [], 0, False),
-    "pthread_exit": (NM_RET_VOID, [NM_ARG_PTR], 0, False),
-    "pthread_mutex_init": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "pthread_mutex_destroy": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "pthread_mutex_lock": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "pthread_mutex_trylock": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "pthread_mutex_unlock": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "pthread_cond_init": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "pthread_cond_destroy": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "pthread_cond_wait": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "pthread_cond_timedwait": (NM_RET_I32, [NM_ARG_PTR, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "pthread_cond_signal": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "pthread_cond_broadcast": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    "atexit": (NM_RET_I32, [NM_ARG_U32], 0, False),
-    "__cxa_atexit": (NM_RET_I32, [NM_ARG_U32, NM_ARG_U32, NM_ARG_U32], 0, False),
-    "__cxa_finalize": (NM_RET_VOID, [NM_ARG_U32], 0, False),
-    "signal": (NM_RET_U32, [NM_ARG_I32, NM_ARG_U32], 0, False),
-    "sigaction": (NM_RET_I32, [NM_ARG_I32, NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "exit": (NM_RET_VOID, [NM_ARG_I32], 0, False),
-    "quick_exit": (NM_RET_VOID, [NM_ARG_I32], 0, False),
-    "_exit": (NM_RET_VOID, [NM_ARG_I32], 0, False),
-    "abort": (NM_RET_VOID, [], 0, False),
-    "__stack_chk_fail": (NM_RET_VOID, [], 0, False),
-    "__errno_location": (NM_RET_PTR, [], 0, False),
-    "__libc_start_main": (NM_RET_I32, [NM_ARG_U32, NM_ARG_I32, NM_ARG_PTR, NM_ARG_U32, NM_ARG_U32, NM_ARG_U32], 0, False),
-    # dlfcn
-    "dlopen": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_I32], 0, False),
-    "dlsym": (NM_RET_PTR, [NM_ARG_PTR, NM_ARG_PTR], 0, False),
-    "dlerror": (NM_RET_PTR, [], 0, False),
-    "dlclose": (NM_RET_I32, [NM_ARG_PTR], 0, False),
-    # libm
-    "sqrt": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "sqrtf": (NM_RET_F32, [NM_ARG_F32], 0, False),
-    "sin": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "sinf": (NM_RET_F32, [NM_ARG_F32], 0, False),
-    "cos": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "cosf": (NM_RET_F32, [NM_ARG_F32], 0, False),
-    "tan": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "tanf": (NM_RET_F32, [NM_ARG_F32], 0, False),
-    "atan2": (NM_RET_F64, [NM_ARG_F64, NM_ARG_F64], 0, False),
-    "pow": (NM_RET_F64, [NM_ARG_F64, NM_ARG_F64], 0, False),
-    "powf": (NM_RET_F32, [NM_ARG_F32, NM_ARG_F32], 0, False),
-    "exp": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "log": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "log10": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "fabs": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "fabsf": (NM_RET_F32, [NM_ARG_F32], 0, False),
-    "floor": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "ceil": (NM_RET_F64, [NM_ARG_F64], 0, False),
-    "round": (NM_RET_F64, [NM_ARG_F64], 0, False),
-}
-
-COMPAT_DATA_SYMS = {
-    "stdin",
-    "stdout",
-    "stderr",
-    "optarg",
-    "optind",
-    "opterr",
-    "optopt",
-    "environ",
-}
-
-WEAK_CRT_SYMS = {
-    "__gmon_start__",
-    "_ITM_registerTMCloneTable",
-    "_ITM_deregisterTMCloneTable",
-}
+from .lookup import (
+    LookupSymEntry,
+    LookupTable,
+    ParsedSig,
+    NM_RET_VOID,
+    NM_RET_I32,
+    NM_RET_U32,
+    NM_RET_PTR,
+    NM_RET_I64,
+    NM_RET_U64,
+    NM_RET_F32,
+    NM_RET_F64,
+    NM_ARG_NONE,
+    NM_ARG_I32,
+    NM_ARG_U32,
+    NM_ARG_PTR,
+    NM_ARG_I64,
+    NM_ARG_U64,
+    NM_ARG_F32,
+    NM_ARG_F64,
+    NM_MAX_SIG_ARGS,
+    NM_SIG_EXT_SRET,
+    NM_SIG_EXT_CALLEE_POP4,
+    NM_SYM_FLAG_DATA,
+    NM_SYM_FLAG_VARIADIC,
+    NM_SYM_FLAG_CDECL_DIRECT,
+    NM_SYM_FLAG_IFUNC,
+    NM_SYM_FLAG_NATIVE,
+    NM_SYM_FLAG_PATCHED,
+    NM_SYM_FLAG_STATIC_ONLY,
+    NM_SYM_FLAG_RUNTIME_ONLY,
+    NM_SYM_FLAG_WEAK,
+    NM_SYM_FLAG_PURE,
+    NM_LK_NONE,
+    NM_LK_COMPAT,
+    NM_LK_NATIVE_TYPED,
+    NM_LK_NATIVE_DATA,
+    NM_LK_PATCHED_CDECL,
+    NM_LK_ALIAS,
+    NM_LK_UNTYPED,
+    NM_LK_FORBIDDEN,
+    NM_LK_NATIVE_LIB,
+)
 
 
-def map_import_symbol_name(orig_name: str) -> str:
-    """Map an i386 imported symbol name to its libnewminhh_compat.so wrapper symbol."""
-    if orig_name in WEAK_CRT_SYMS:
-        return orig_name
-    if orig_name == "dlsym":
-        return "compat_dlsym_cdecl"
-    if orig_name in ("printf", "fprintf", "sprintf", "snprintf"):
-        return f"compat_{orig_name}_cdecl"
-    if orig_name in COMPAT_SIGNATURES or orig_name in COMPAT_DATA_SYMS:
-        return f"compat_{orig_name}"
-    return orig_name
+def resolve_import_binding(
+    lookup_table: LookupTable,
+    orig_sym: str,
+    orig_soname: Optional[str],
+    orig_ver: Optional[str],
+    allow_untyped_unsafe: bool = False,
+    dt_needed: Optional[List[str]] = None,
+) -> LookupSymEntry:
+    """Resolve an imported symbol binding via lookup_table.
+
+    Uses lookup_table.resolve_sym(..., mode="static") and lookup_table.check_bindable(...)
+    (failing loudly on UNTYPED unless allow_untyped_unsafe=True, and ALWAYS failing loudly on FORBIDDEN_ABI).
+    Handles weak CRT symbols (WEAK flag, e.g. __gmon_start__, _ITM_*, _Jv_RegisterClasses) cleanly.
+    """
+    entry: Optional[LookupSymEntry] = None
+    if orig_soname:
+        entry = lookup_table.resolve_sym(orig_soname, orig_sym, orig_ver, mode="static")
+    if entry is None:
+        entry = lookup_table.resolve_sym("*", orig_sym, orig_ver, mode="static")
+    if entry is None and dt_needed:
+        for needed_so in dt_needed:
+            cand = lookup_table.resolve_sym(needed_so, orig_sym, orig_ver, mode="static")
+            if cand is not None:
+                entry = cand
+                break
+
+    if entry is None and orig_sym in ("__environ", "_environ"):
+        e_env = lookup_table.resolve_sym(orig_soname or "*", "environ", orig_ver, mode="static")
+        if e_env is not None:
+            return LookupSymEntry(
+                soname=e_env.soname,
+                sym=orig_sym,
+                tgt_soname=e_env.tgt_soname,
+                tgt_sym=e_env.tgt_sym,
+                tgt_ver=e_env.tgt_ver,
+                cls=e_env.cls,
+                sig_str=e_env.sig_str,
+                parsed_sig=e_env.parsed_sig,
+                flags=e_env.flags,
+                raw_flags=e_env.raw_flags,
+                size=e_env.size,
+                reason=e_env.reason,
+                sym_ver=e_env.sym_ver,
+                line_no=e_env.line_no,
+            )
+
+    if entry is None and orig_sym.startswith("__nm_ifunc_"):
+        synth_sig = ParsedSig(
+            ret_kind=NM_RET_VOID,
+            nargs=0,
+            is_variadic=False,
+            abi_ext=0,
+            arg_kinds=(),
+        )
+        return LookupSymEntry(
+            soname="*",
+            sym=orig_sym,
+            tgt_soname="",
+            tgt_sym=orig_sym,
+            tgt_ver=None,
+            cls="PATCHED_CDECL",
+            sig_str="v:",
+            parsed_sig=synth_sig,
+            flags=NM_SYM_FLAG_IFUNC | NM_SYM_FLAG_PATCHED,
+            raw_flags="IFUNC,PATCHED",
+            size=0,
+            reason=None,
+            sym_ver=None,
+            line_no=0,
+        )
+
+    # Check for weak CRT symbols
+    is_weak_crt = (
+        orig_sym in ("__gmon_start__", "_Jv_RegisterClasses", "_ITM_registerTMCloneTable", "_ITM_deregisterTMCloneTable")
+        or orig_sym.startswith("_ITM_")
+    )
+    if entry is None and is_weak_crt:
+        synth_sig = ParsedSig(
+            ret_kind=NM_RET_VOID,
+            nargs=0,
+            is_variadic=False,
+            abi_ext=0,
+            arg_kinds=(),
+        )
+        return LookupSymEntry(
+            soname=orig_soname or "*",
+            sym=orig_sym,
+            tgt_soname="libnewminhh_compat.so",
+            tgt_sym=orig_sym,
+            tgt_ver=None,
+            cls="COMPAT",
+            sig_str="v:",
+            parsed_sig=synth_sig,
+            flags=NM_SYM_FLAG_WEAK | NM_SYM_FLAG_STATIC_ONLY,
+            raw_flags="WEAK,STATIC_ONLY",
+            size=0,
+            reason=None,
+            sym_ver=orig_ver,
+            line_no=0,
+        )
+
+    if entry is not None and (entry.flags & NM_SYM_FLAG_WEAK):
+        if entry.is_forbidden:
+            reason_str = f" ({entry.reason})" if entry.reason else ""
+            raise PatcherError(f"Symbol '{orig_soname or '*'}:{orig_sym}' has FORBIDDEN_ABI{reason_str}")
+        return entry
+
+    return lookup_table.check_bindable(
+        entry,
+        sym=orig_sym,
+        soname=orig_soname or "*",
+        allow_untyped_unsafe=allow_untyped_unsafe,
+    )
 
 
-def encode_nm_fn_sig(sym_name: str) -> bytes:
-    """Encode nm_fn_sig_t (20 bytes) matching src/common/newminhh_abi.h."""
-    if sym_name in COMPAT_SIGNATURES:
-        ret_k, args, is_var, _ = COMPAT_SIGNATURES[sym_name]
-    elif sym_name in WEAK_CRT_SYMS:
-        ret_k, args, is_var = NM_RET_VOID, [], 0
-    else:
-        ret_k, args, is_var = NM_RET_U32, [NM_ARG_U32] * 6, 0
-    padded = (args + [0] * 16)[:16]
-    return struct.pack("<BBBB16B", ret_k, len(args), is_var, 0, *padded)
+def encode_nm_fn_sig(entry: LookupSymEntry) -> bytes:
+    """Encode nm_fn_sig_t (20 bytes) delegating to entry.parsed_sig.encode_nm_fn_sig()."""
+    if entry.parsed_sig is not None:
+        return entry.parsed_sig.encode_nm_fn_sig()
+    return ParsedSig(ret_kind=NM_RET_VOID, nargs=0, is_variadic=False, abi_ext=0, arg_kinds=()).encode_nm_fn_sig()
 
 
 def assemble_and_link_helpers(
@@ -277,6 +186,7 @@ def assemble_and_link_helpers(
     data_va: int,
     bss_va: int,
     defsyms: Dict[str, int],
+    extra_objs: Optional[List[Tuple[str, bytes]]] = None,
 ) -> Tuple[bytes, bytes, bytes, int, Dict[str, int]]:
     """Assemble x32 GAS source and link at fixed section VAs using ld -m elf32_x86_64.
 
@@ -285,7 +195,7 @@ def assemble_and_link_helpers(
     as_bin = shutil.which("as")
     ld_bin = shutil.which("ld")
     if not as_bin or not ld_bin:
-        raise PatcherError("GNU 'as' and 'ld' are required inside re-env:latest")
+        raise PatcherError("GNU 'as' and 'ld' are required in PATH")
 
     with tempfile.TemporaryDirectory(prefix="nm_asm_") as tmpdir:
         s_path = os.path.join(tmpdir, "helpers.s")
@@ -320,6 +230,13 @@ def assemble_and_link_helpers(
         for k, v in defsyms.items():
             ld_cmd.extend(["--defsym", f"{k}=0x{v:x}"])
         ld_cmd.append(o_path)
+
+        if extra_objs:
+            for obj_idx, (obj_name, obj_data) in enumerate(extra_objs):
+                extra_path = os.path.join(tmpdir, f"extra_{obj_idx}_{obj_name}.o")
+                with open(extra_path, "wb") as ef:
+                    ef.write(obj_data)
+                ld_cmd.append(extra_path)
 
         p_ld = subprocess.run(ld_cmd, capture_output=True, text=True)
         if p_ld.returncode != 0:
@@ -364,8 +281,22 @@ def generate_helper_assembly(
     ref_va_for_bias: int,
     init_array_labels: Optional[List[str]] = None,
     fini_array_labels: Optional[List[str]] = None,
+    lookup_table: Optional[LookupTable] = None,
+    plt_entries_resolved: Optional[List[LookupSymEntry]] = None,
+    copy_data_slots: Optional[Dict[str, int]] = None,
+    ifunc_thunks: Optional[List[Tuple[int, int]]] = None,
+    plt_stub_asm_override: Optional[Union[Dict[int, str], Callable[[int, str, LookupSymEntry], Optional[str]]]] = None,
+    export_targets: Optional[List[Tuple[str, int]]] = None,
 ) -> str:
     """Generate complete x32 GAS assembly for runtime helpers, PLT stubs, and entry shims."""
+    if plt_entries_resolved is None:
+        if lookup_table is None:
+            lookup_table = LookupTable.load()
+        plt_entries_resolved = [
+            resolve_import_binding(lookup_table, sname, None, None, allow_untyped_unsafe=True)
+            for sname, _gva, _sidx in plt_entries
+        ]
+
     lines: List[str] = []
     lines.append(".text")
 
@@ -387,7 +318,7 @@ def generate_helper_assembly(
         lines.append(f"    jmp __nm_plt_{idx}")
         lines.append("    .p2align 3")
 
-    # 2. __nm_ensure_gs_init (idempotent GS + PT_TLS + R_386_COPY stdio initializer)
+    # 2. __nm_ensure_gs_init (idempotent GS + PT_TLS + R_386_COPY stdio/environ initializer)
     # Preserves all GPRs & RDX (_dl_fini)!
     lines.append(".globl __nm_ensure_gs_init")
     lines.append("__nm_ensure_gs_init:")
@@ -420,8 +351,8 @@ def generate_helper_assembly(
     if tls_info is not None and tls_info[2] > 0:
         tls_vaddr, _off, tls_filesz, tls_memsz, tls_align = tls_info
         tcb_alloc = ((max(tls_memsz, tls_filesz) + max(tls_align, 4) - 1) & ~(max(tls_align, 4) - 1))
-        lines.append(f"    leal sym_orig_tls_data(%rip), %esi")
-        lines.append(f"    movl %edx, %edi")
+        lines.append("    leal sym_orig_tls_data(%rip), %esi")
+        lines.append("    movl %edx, %edi")
         lines.append(f"    subl ${tcb_alloc}, %edi")
         lines.append(f"    movl ${tls_filesz}, %ecx")
         lines.append("    cld")
@@ -454,6 +385,35 @@ def generate_helper_assembly(
             lines.append(f"    leal sym_copy_{sname}(%rip), %ecx")
             lines.append("    movl %eax, (%rcx)")
         lines.append(".Lnm_stdio_done:")
+
+    # Call newminhh_compat_fixup_copy_data with slots for environ, optarg, optind, opterr, optopt
+    if copy_data_slots:
+        lines.append("    movl got_newminhh_compat_fixup_copy_data(%rip), %r11d")
+        lines.append("    testl %r11d, %r11d")
+        lines.append("    jz .Lnm_copy_data_done")
+        if "environ" in copy_data_slots:
+            lines.append("    leal sym_copy_environ(%rip), %edi")
+        else:
+            lines.append("    xorl %edi, %edi")
+        if "optarg" in copy_data_slots:
+            lines.append("    leal sym_copy_optarg(%rip), %esi")
+        else:
+            lines.append("    xorl %esi, %esi")
+        if "optind" in copy_data_slots:
+            lines.append("    leal sym_copy_optind(%rip), %edx")
+        else:
+            lines.append("    xorl %edx, %edx")
+        if "opterr" in copy_data_slots:
+            lines.append("    leal sym_copy_opterr(%rip), %ecx")
+        else:
+            lines.append("    xorl %ecx, %ecx")
+        if "optopt" in copy_data_slots:
+            lines.append("    leal sym_copy_optopt(%rip), %r8d")
+        else:
+            lines.append("    xorl %r8d, %r8d")
+        lines.append("    call *%r11")
+        lines.append(".Lnm_copy_data_done:")
+
     lines.append("    movq 16(%rsp), %rsp")
     lines.append("    popq %r11")
     lines.append("    popq %r10")
@@ -551,6 +511,10 @@ def generate_helper_assembly(
                 lines.append(f"    jz .Lnm_skip_{lbl}")
                 lines.append("    call *%r11")
                 lines.append(f".Lnm_skip_{lbl}:")
+            # Invoke main-executable DT_INIT_ARRAY constructors here in _nm_start because
+            # neither glibc ld-linux-x32.so.2 nor musl ld-musl-x32.so.1 executes DT_INIT_ARRAY
+            # for the main executable (only for DSOs). Each __nm_initarr_* shim is guarded by a
+            # .bss run-once byte so constructors execute strictly once under any dynamic linker.
             for lbl in (init_array_labels or []):
                 lines.append("    movl (%r12), %edi")
                 lines.append("    leal 4(%r12), %esi")
@@ -605,12 +569,21 @@ def generate_helper_assembly(
     lines.append("    popq %rbx")
     lines.append("    ret")
 
-    # 6. Per-export / init_array / fini_array x32->cdecl stubs
+    # 6. Per-init_array / fini_array x32->cdecl stubs (each run-once guarded)
     for lbl, _va in x32_entry_targets:
         lines.append(f".globl {lbl}")
         lines.append(f"{lbl}:")
+        if lbl.startswith("__nm_initarr_"):
+            idx_str = lbl[len("__nm_initarr_") :]
+            lines.append(f".globl __nm_init_tramp_{idx_str}")
+            lines.append(f"__nm_init_tramp_{idx_str}:")
+        lines.append(f"    cmpb $0, __nm_arr_done_{lbl}(%rip)")
+        lines.append(f"    jne .Larr_skip_{lbl}")
+        lines.append(f"    movb $1, __nm_arr_done_{lbl}(%rip)")
         lines.append(f"    leal target_{lbl}(%rip), %r11d")
         lines.append("    jmp __nm_x32_to_cdecl_common")
+        lines.append(f".Larr_skip_{lbl}:")
+        lines.append("    ret")
 
     # 7. Dual-ABI common check + per-function dual-ABI stubs
     #    Entered with %r11d = target cdecl VA. Checks if (%rsp) is inside
@@ -689,6 +662,67 @@ def generate_helper_assembly(
         lines.append(f"    leal target_{lbl}(%rip), %r11d")
         lines.append("    jmp __nm_dual_abi_common")
 
+    # Patched-DSO exported functions: use __nm_dual_abi_common so x32 callers get bridged
+    # while cdecl callers execute with zero marshaling!
+    for lbl, _va in (export_targets or []):
+        lines.append(f".globl {lbl}")
+        lines.append(f"{lbl}:")
+        lines.append(f"    leal target_{lbl}(%rip), %r11d")
+        lines.append("    jmp __nm_dual_abi_common")
+
+    # 7b. R_386_IRELATIVE resolver thunks (__nm_ifunc_<i>)
+    # Called by dynamic linker as an x32 SysV function; bridges to guest cdecl resolver,
+    # and translates the returned original function VA to rewritten code VA.
+    for idx, _rva in (ifunc_thunks or []):
+        lines.append(f".globl __nm_ifunc_{idx}")
+        lines.append(f"__nm_ifunc_{idx}:")
+        lines.append("    pushq %rbx")
+        lines.append("    pushq %rbp")
+        lines.append("    pushq %r12")
+        lines.append("    pushq %r13")
+        lines.append("    pushq %r14")
+        lines.append("    pushq %r15")
+        lines.append("    movq %rsp, %r12")
+        lines.append("    andq $-16, %rsp")
+        lines.append(f"    leal target___nm_ifunc_{idx}(%rip), %r11d")
+        lines.append("    call __nm_x32_to_cdecl_common")
+        lines.append("    movl %eax, %r11d")
+        lines.append("    leal sym_text_new_start(%rip), %r10d")
+        lines.append("    cmpl %r10d, %r11d")
+        lines.append(f"    jb .Lifunc_trans_{idx}")
+        lines.append("    leal sym_text_new_end(%rip), %r10d")
+        lines.append("    cmpl %r10d, %r11d")
+        lines.append(f"    jb .Lifunc_done_{idx}")
+        lines.append(f".Lifunc_trans_{idx}:")
+        if orig_to_new_pairs:
+            lines.append("    leal __nm_dispatch_vec(%rip), %r10d")
+            lines.append(f"    subl $0x{ref_va_for_bias:x}, %r10d")
+            lines.append("    movl %r11d, %eax")
+            lines.append("    subl %r10d, %eax")
+            lines.append("    leal __nm_orig_to_new_tbl(%rip), %ecx")
+            lines.append(f"    movl ${len(orig_to_new_pairs)}, %edx")
+            lines.append(f".Lifunc_map_loop_{idx}:")
+            lines.append("    testl %edx, %edx")
+            lines.append(f"    jz .Lifunc_done_{idx}")
+            lines.append("    cmpl (%rcx), %eax")
+            lines.append(f"    je .Lifunc_map_hit_{idx}")
+            lines.append("    addl $8, %ecx")
+            lines.append("    decl %edx")
+            lines.append(f"    jmp .Lifunc_map_loop_{idx}")
+            lines.append(f".Lifunc_map_hit_{idx}:")
+            lines.append("    movl 4(%rcx), %r11d")
+            lines.append("    addl %r10d, %r11d")
+        lines.append(f".Lifunc_done_{idx}:")
+        lines.append("    movl %r11d, %eax")
+        lines.append("    movq %r12, %rsp")
+        lines.append("    popq %r15")
+        lines.append("    popq %r14")
+        lines.append("    popq %r13")
+        lines.append("    popq %r12")
+        lines.append("    popq %rbp")
+        lines.append("    popq %rbx")
+        lines.append("    ret")
+
     # 8. __nm_icall (indirect cdecl call to %r11d)
     lines.append(".globl __nm_icall")
     lines.append("__nm_icall:")
@@ -722,15 +756,43 @@ def generate_helper_assembly(
     lines.append(".Lic_chk_out_tramp:")
     lines.append("    movl got_newminhh_out_common(%rip), %r10d")
     lines.append("    testl %r10d, %r10d")
-    lines.append("    jz .Lic_external_x32")
+    lines.append("    jz .Lic_chk_reg_cdecl")
     lines.append("    cmpw $0xbb41, (%r11)")
-    lines.append("    jne .Lic_external_x32")
+    lines.append("    jne .Lic_chk_reg_cdecl")
     lines.append("    cmpb $0xe9, 6(%r11)")
-    lines.append("    jne .Lic_external_x32")
+    lines.append("    jne .Lic_chk_reg_cdecl")
     lines.append("    movslq 7(%r11), %rax")
     lines.append("    leal 11(%r11, %rax), %eax")
     lines.append("    cmpl %r10d, %eax")
     lines.append("    je .Lic_out_tramp")
+    lines.append(".Lic_chk_reg_cdecl:")
+    lines.append("    movl got_newminhh_is_native_cdecl_va(%rip), %r10d")
+    lines.append("    testl %r10d, %r10d")
+    lines.append("    jz .Lic_external_x32")
+    lines.append("    movq %rsp, %r10")
+    lines.append("    andq $-16, %rsp")
+    lines.append("    subq $64, %rsp")
+    lines.append("    movq %r10, 0(%rsp)")
+    lines.append("    movq %r11, 8(%rsp)")
+    lines.append("    movq %rdi, 16(%rsp)")
+    lines.append("    movq %rsi, 24(%rsp)")
+    lines.append("    movq %rax, 32(%rsp)")
+    lines.append("    movq %rcx, 40(%rsp)")
+    lines.append("    movq %rdx, 48(%rsp)")
+    lines.append("    movl %r11d, %edi")
+    lines.append("    movl got_newminhh_is_native_cdecl_va(%rip), %eax")
+    lines.append("    call *%rax")
+    lines.append("    testl %eax, %eax")
+    lines.append("    setnz %r10b")
+    lines.append("    movq 48(%rsp), %rdx")
+    lines.append("    movq 40(%rsp), %rcx")
+    lines.append("    movq 32(%rsp), %rax")
+    lines.append("    movq 24(%rsp), %rsi")
+    lines.append("    movq 16(%rsp), %rdi")
+    lines.append("    movq 8(%rsp), %r11")
+    lines.append("    movq 0(%rsp), %rsp")
+    lines.append("    testb %r10b, %r10b")
+    lines.append("    jnz .Lic_direct_cdecl")
     lines.append(".Lic_external_x32:")
     lines.append("    movq %rsp, %r10")
     lines.append("    andq $-16, %rsp")
@@ -819,15 +881,15 @@ def generate_helper_assembly(
     lines.append(".Lij_chk_out_tramp:")
     lines.append("    movl got_newminhh_out_common(%rip), %r10d")
     lines.append("    testl %r10d, %r10d")
-    lines.append("    jz .Lic_external_x32")
+    lines.append("    jz .Lic_chk_reg_cdecl")
     lines.append("    cmpw $0xbb41, (%r11)")
-    lines.append("    jne .Lic_external_x32")
+    lines.append("    jne .Lic_chk_reg_cdecl")
     lines.append("    cmpb $0xe9, 6(%r11)")
-    lines.append("    jne .Lic_external_x32")
+    lines.append("    jne .Lic_chk_reg_cdecl")
     lines.append("    movslq 7(%r11), %rax")
     lines.append("    leal 11(%r11, %rax), %eax")
     lines.append("    cmpl %r10d, %eax")
-    lines.append("    jne .Lic_external_x32")
+    lines.append("    jne .Lic_chk_reg_cdecl")
     lines.append(".Lij_direct_cdecl:")
     lines.append("    jmp *%r11")
 
@@ -869,8 +931,31 @@ def generate_helper_assembly(
 
     # 10. Per-PLT stubs (must preserve i386 callee-saved %rsi and %rdi!)
     for idx, (orig_sym, _got_va, _slot_idx) in enumerate(plt_entries):
-        sig_info = COMPAT_SIGNATURES.get(orig_sym)
-        is_cdecl_direct = sig_info[3] if sig_info else False
+        entry = plt_entries_resolved[idx]
+
+        # Support custom PLT stub override
+        custom_asm = None
+        if plt_stub_asm_override is not None:
+            if callable(plt_stub_asm_override):
+                custom_asm = plt_stub_asm_override(idx, orig_sym, entry)
+            elif isinstance(plt_stub_asm_override, dict) and idx in plt_stub_asm_override:
+                custom_asm = plt_stub_asm_override[idx]
+
+        if custom_asm is not None:
+            lines.append(custom_asm)
+            continue
+
+        # If PATCHED_CDECL: emit 2-instruction direct tail jump keeping cdecl stack intact!
+        if entry.cls == "PATCHED_CDECL":
+            lines.append(f".globl __nm_plt_{idx}")
+            lines.append(f"__nm_plt_{idx}:")
+            lines.append(f"    movl sym_got_plt_{idx}(%rip), %r11d")
+            lines.append("    jmp *%r11")
+            continue
+
+        is_cdecl_direct = bool(entry.flags & NM_SYM_FLAG_CDECL_DIRECT) or getattr(entry, "is_cdecl_direct", False)
+        is_callee_pop4 = bool(entry.parsed_sig and (entry.parsed_sig.abi_ext & NM_SIG_EXT_CALLEE_POP4))
+
         lines.append(f".globl __nm_plt_{idx}")
         lines.append(f"__nm_plt_{idx}:")
         lines.append("    movq %rsp, %r10")
@@ -895,9 +980,15 @@ def generate_helper_assembly(
         lines.append("    movq 16(%rsp), %rdi")
         lines.append("    movq 8(%rsp), %rsi")
         lines.append("    movq 0(%rsp), %rsp")
-        lines.append("    movl (%rsp), %r11d")
-        lines.append("    leaq 4(%rsp), %rsp")
-        lines.append("    jmp *%r11")
+        if is_callee_pop4:
+            # i386 SysV struct return: callee pops 4 bytes (sret pointer) on return!
+            lines.append("    movl (%rsp), %r11d")
+            lines.append("    leaq 8(%rsp), %rsp")
+            lines.append("    jmp *%r11")
+        else:
+            lines.append("    movl (%rsp), %r11d")
+            lines.append("    leaq 4(%rsp), %rsp")
+            lines.append("    jmp *%r11")
 
     # 11. Per-function hybrid DBT fallback stubs (newminhh_dbt_enter_at)
     for lbl, orig_va in fallback_funcs:
@@ -952,8 +1043,9 @@ def generate_helper_assembly(
     # .rodata section for signatures and orig_to_new table
     lines.append(".section .rodata")
     lines.append(".p2align 4")
-    for idx, (orig_sym, _got_va, _slot_idx) in enumerate(plt_entries):
-        sig_bytes = encode_nm_fn_sig(orig_sym)
+    for idx, (_orig_sym, _got_va, _slot_idx) in enumerate(plt_entries):
+        entry = plt_entries_resolved[idx]
+        sig_bytes = encode_nm_fn_sig(entry)
         hex_bytes = ", ".join(f"0x{b:02x}" for b in sig_bytes)
         lines.append(f"__nm_sig_{idx}:")
         lines.append(f"    .byte {hex_bytes}")
@@ -964,6 +1056,20 @@ def generate_helper_assembly(
         for ova, nva in orig_to_new_pairs:
             lines.append(f"    .long 0x{ova:08x}, 0x{nva:08x}")
 
+    if init_array_labels:
+        lines.append(".p2align 2")
+        lines.append(".globl __nm_synthetic_init_array")
+        lines.append("__nm_synthetic_init_array:")
+        for lbl in init_array_labels:
+            lines.append(f"    .long {lbl}")
+
+    if fini_array_labels:
+        lines.append(".p2align 2")
+        lines.append(".globl __nm_synthetic_fini_array")
+        lines.append("__nm_synthetic_fini_array:")
+        for lbl in fini_array_labels:
+            lines.append(f"    .long {lbl}")
+
     # .bss section for main-thread GS TLS buffer (4 KiB) and init/fini guards
     lines.append(".bss")
     lines.append(".p2align 4")
@@ -973,6 +1079,9 @@ def generate_helper_assembly(
     lines.append("    .byte 0")
     lines.append("__nm_fini_done:")
     lines.append("    .byte 0")
+    for lbl, _va in x32_entry_targets:
+        lines.append(f"__nm_arr_done_{lbl}:")
+        lines.append("    .byte 0")
     lines.append('.section .note.GNU-stack,"",@progbits')
 
     return "\n".join(lines) + "\n"

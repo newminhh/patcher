@@ -1,5 +1,7 @@
 __pycache__/
 *.py[cod]
+*.pyc
+re_patcher/_lookup_registry_gen.py
 *$py.class
 *.o
 *.so
